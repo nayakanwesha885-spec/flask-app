@@ -1,0 +1,60 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 720 900" role="img" aria-labelledby="title desc">
+  <title id="title">Traditional Ayurvedic mortar and pestle with medicinal leaves</title>
+  <desc id="desc">A hand-carved stone mortar and wooden pestle surrounded by neem and tulsi leaves.</desc>
+  <defs>
+    <radialGradient id="backdrop" cx="50%" cy="42%" r="65%">
+      <stop offset="0" stop-color="#fffaf0"/>
+      <stop offset="1" stop-color="#d5e3b2"/>
+    </radialGradient>
+    <linearGradient id="stone" x1="0" x2="1" y1="0" y2="1">
+      <stop offset="0" stop-color="#d7bfa2"/>
+      <stop offset=".48" stop-color="#ae8b6c"/>
+      <stop offset="1" stop-color="#765946"/>
+    </linearGradient>
+    <linearGradient id="wood" x1="0" x2="1" y1="0" y2="1">
+      <stop offset="0" stop-color="#d9a064"/>
+      <stop offset=".55" stop-color="#9b5b35"/>
+      <stop offset="1" stop-color="#633724"/>
+    </linearGradient>
+    <filter id="shadow" x="-30%" y="-30%" width="160%" height="180%">
+      <feGaussianBlur in="SourceAlpha" stdDeviation="13"/>
+      <feOffset dy="18"/>
+      <feComponentTransfer><feFuncA type="linear" slope=".22"/></feComponentTransfer>
+      <feMerge><feMergeNode/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+  </defs>
+  <rect width="720" height="900" fill="url(#backdrop)"/>
+  <circle cx="358" cy="440" r="286" fill="#fffaf0" opacity=".5"/>
+  <ellipse cx="362" cy="744" rx="184" ry="32" fill="#72523e" opacity=".18"/>
+  <g fill="none" stroke="#2d7556" stroke-linecap="round" stroke-width="10">
+    <path d="M94 754C150 612 236 512 337 439"/>
+    <path d="M628 738C585 601 507 510 402 438"/>
+    <path d="M141 210C242 260 294 331 330 423"/>
+    <path d="M582 170C491 247 445 329 405 421"/>
+  </g>
+  <g fill="#5b9a62" stroke="#2d7556" stroke-width="5">
+    <ellipse cx="132" cy="683" rx="34" ry="91" transform="rotate(35 132 683)"/>
+    <ellipse cx="183" cy="603" rx="31" ry="83" transform="rotate(53 183 603)"/>
+    <ellipse cx="243" cy="548" rx="29" ry="79" transform="rotate(66 243 548)"/>
+    <ellipse cx="111" cy="263" rx="34" ry="91" transform="rotate(-54 111 263)"/>
+    <ellipse cx="190" cy="293" rx="31" ry="83" transform="rotate(-42 190 293)"/>
+    <ellipse cx="560" cy="667" rx="34" ry="91" transform="rotate(-37 560 667)"/>
+    <ellipse cx="518" cy="588" rx="30" ry="82" transform="rotate(-54 518 588)"/>
+    <ellipse cx="585" cy="233" rx="35" ry="92" transform="rotate(54 585 233)"/>
+    <ellipse cx="507" cy="284" rx="31" ry="82" transform="rotate(41 507 284)"/>
+  </g>
+  <g transform="translate(0 30)" filter="url(#shadow)">
+    <path d="M245 485C251 589 286 657 360 674C434 657 469 589 475 485Z" fill="url(#stone)" stroke="#654a3a" stroke-width="9"/>
+    <path d="M267 548C292 607 324 634 360 639C396 634 428 607 453 548" fill="none" stroke="#e5ceb0" stroke-width="8" opacity=".42"/>
+    <ellipse cx="360" cy="486" rx="118" ry="38" fill="#9a775b" stroke="#654a3a" stroke-width="9"/>
+    <ellipse cx="360" cy="486" rx="86" ry="23" fill="#49382e"/>
+    <path d="M291 515C313 540 407 540 429 515" fill="none" stroke="#e5ceb0" stroke-width="7" opacity=".65"/>
+    <path d="M433 188C446 193 457 207 453 224L388 493C384 511 367 521 350 517C333 513 322 497 326 480L391 211C395 194 415 183 433 188Z" fill="url(#wood)" stroke="#633724" stroke-width="9"/>
+    <path d="M406 214L382 312" stroke="#f0bd7c" stroke-width="8" stroke-linecap="round" opacity=".65"/>
+    <path d="M355 493C364 499 376 499 384 493" fill="none" stroke="#bd8758" stroke-width="5"/>
+  </g>
+  <g fill="#a85b35">
+    <circle cx="87" cy="472" r="8"/><circle cx="623" cy="445" r="8"/><circle cx="594" cy="791" r="7"/>
+    <circle cx="113" cy="500" r="5"/><circle cx="603" cy="470" r="5"/>
+  </g>
+</svg>
