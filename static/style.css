@@ -15,8 +15,8 @@
 .voice-btn:hover, .voice-btn.recording { background: var(--orange); color: white; }
 .voice-btn:disabled { cursor: not-allowed; opacity: .45; }
 .voice-status { color: var(--orange); font-size: 11px; min-height: 17px; padding-top: 6px; }
-.loading > span:last-child { display: none; }
-.loading { display: none !important; }
+.loading { align-items: center; background: var(--mint); border: 1px solid rgba(45,117,86,.2); border-radius: 999px; color: var(--deep); display: none; font-size: 12px; gap: 10px; margin-top: 18px; padding: 10px 14px; }
+.loading.visible { display: flex !important; }
 .page-section:not(.active-section), .signal-strip.hidden-view { display: none !important; }
 .page-section.active-section { animation: view-in .35s ease both; }
 @keyframes view-in { from { opacity: 0; } to { opacity: 1; } }

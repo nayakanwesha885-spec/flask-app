@@ -371,6 +371,16 @@ function updateInterface() {
     document.querySelector(".footer-inner > a").textContent = ui.top;
 }
 
+function setLoadingState(isLoading) {
+    const loadingElement = document.getElementById("loading");
+    if (!loadingElement) {
+        return;
+    }
+
+    loadingElement.classList.toggle("visible", isLoading);
+    loadingElement.classList.toggle("hidden", !isLoading);
+}
+
 async function askQuestion() {
 
     const questionInput = document.getElementById("question");
@@ -386,6 +396,7 @@ async function askQuestion() {
     }
 
     answer.innerText = getTranslation("thinking");
+    setLoadingState(true);
     askButton.disabled = true;
 
     try {
@@ -447,6 +458,7 @@ async function askQuestion() {
         }
     } finally {
         askButton.disabled = false;
+        setLoadingState(false);
     }
 }
 
@@ -455,6 +467,7 @@ function clearChat() {
     document.getElementById("answer").innerText = "";
     document.getElementById("sources").innerHTML = "";
     document.getElementById("askBtn").disabled = false;
+    setLoadingState(false);
     document.getElementById("question").focus();
 }
 

@@ -62,10 +62,15 @@ STOP_WORDS = {
     "a", "an", "and", "are", "about", "for", "how", "in", "is", "of", "on",
     "the", "to", "what", "which", "with", "can", "does", "do", "from", "under"
 }
+KNOWLEDGE_BASE_CACHE = None
 
 
 @lru_cache(maxsize=1)
 def load_knowledge_base():
+    global KNOWLEDGE_BASE_CACHE
+    if KNOWLEDGE_BASE_CACHE is not None:
+        return KNOWLEDGE_BASE_CACHE
+
     pages = []
     for root, _, files in os.walk(KNOWLEDGE_BASE_DIR):
         for filename in sorted(files):
@@ -81,7 +86,13 @@ def load_knowledge_base():
                         "page": page_number,
                         "text": re.sub(r"\s+", " ", text)
                     })
-    return pages
+
+    KNOWLEDGE_BASE_CACHE = pages
+    return KNOWLEDGE_BASE_CACHE
+
+
+# Warm the local RAG index during app startup so the first browser request is fast.
+load_knowledge_base()
 
 
 def retrieve_pages(question, topic):
@@ -252,25 +263,25 @@ def ask():
             if source not in sources:
                 sources.append(source)
 
-        answer = (
+        base_answer = (
             "Based on the retrieved local knowledge-base documents, here are the most relevant findings:\n\n"
             + "\n\n".join(f"- {excerpt}" for excerpt in excerpts)
             + "\n\nThis is educational guidance only. Verify current legal or regulatory requirements with official sources or a qualified professional."
         )
-        answer = translate_answer(answer, language)
+
+        try:
+            answer = translate_answer(base_answer, language)
+        except TranslationUnavailableError as error:
+            print("TRANSLATION ERROR:", error)
+            # Keep the app functional even when live translation is temporarily unavailable.
+            # Show the original English answer instead of failing the whole request.
+            answer = base_answer
 
         return jsonify({
             "answer": answer,
             "sources": sources,
             "citation_status": "cited"
         })
-
-    except TranslationUnavailableError as error:
-        print("TRANSLATION ERROR:", error)
-        return jsonify({
-            "answer": str(error),
-            "error": error.code
-        }), 503
 
     except Exception as e:
 
