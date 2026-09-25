@@ -259,6 +259,47 @@ const speechLocales = {
 
 let selectedLanguage = document.getElementById("language").value;
 
+const unsafeRequestTerms = [
+    "diagnose", "diagnosis", "dosage", "dose", "prescribe", "prescription", "emergency",
+    "medical treatment", "treatment plan", "cure disease", "poison", "poisoning", "toxic",
+    "toxin", "weaponize", "harm someone", "kill someone", "make poison", "manufacture poison",
+    "illegal drug", "self harm", "evade law", "evade customs", "bypass regulation", "bypass law",
+    "avoid compliance", "counterfeit", "falsify", "fraud", "money laundering", "fake patent",
+    "fake trademark"
+];
+
+const domainHintTerms = [
+    "ayurveda", "ayurvedic", "patent", "patents", "trademark", "trademarks",
+    "geographical indication", "gi", "copyright", "design", "designs",
+    "formulation", "formulations", "regulation", "regulatory", "benefit sharing",
+    "abs", "intellectual property", "ipr", "invention", "inventor", "medicine",
+    "medicinal", "herbal", "traditional knowledge", "traditional"
+];
+
+function detectUnsafeRequest(question) {
+    const normalized = question.trim().toLowerCase().replace(/[^a-z0-9\s]/g, " ").replace(/\s+/g, " ");
+    if (!normalized) {
+        return false;
+    }
+
+    return unsafeRequestTerms.some(function (term) {
+        return normalized.includes(term);
+    });
+}
+
+function detectIrrelevantRequest(question) {
+    const normalized = question.trim().toLowerCase().replace(/[^a-z0-9\s]/g, " ").replace(/\s+/g, " ");
+    if (!normalized) {
+        return true;
+    }
+
+    const matchedHints = domainHintTerms.filter(function (term) {
+        return normalized.includes(term);
+    });
+
+    return matchedHints.length === 0;
+}
+
 function getTranslation(key) {
     const languageTranslation = translations[selectedLanguage] || translations.English;
     return languageTranslation[key] || translations.English[key] || key;
@@ -395,6 +436,18 @@ async function askQuestion() {
         return;
     }
 
+    if (detectUnsafeRequest(question)) {
+        answer.innerText = "I cannot provide medical treatment, dosing, emergency, toxic, harmful, illegal manufacturing, fraud, or law-evasion instructions. I can help with lawful, educational information about Ayurveda intellectual property, traditional knowledge, and regulatory questions. Please consult a qualified professional or the relevant authority.";
+        document.getElementById("sources").innerHTML = "";
+        return;
+    }
+
+    if (detectIrrelevantRequest(question)) {
+        answer.innerText = "This service is limited to Ayurveda, traditional knowledge, intellectual property, and regulatory questions. Please ask a relevant question within those topics.";
+        document.getElementById("sources").innerHTML = "";
+        return;
+    }
+
     answer.innerText = getTranslation("thinking");
     setLoadingState(true);
     askButton.disabled = true;
@@ -451,6 +504,8 @@ async function askQuestion() {
 
         if (error.code === "insufficient_quota") {
             answer.innerText = "Your OpenAI account has no API credits remaining. Add billing credits, restart Flask, and try again.";
+        } else if (error.status === 429 && (error.message || "").toLowerCase().includes("too many irrelevant")) {
+            answer.innerText = error.message || "Too many irrelevant requests in a short time. This service is limited to Ayurveda, traditional knowledge, intellectual property, and regulatory questions.";
         } else if (error.status === 429 || error.code === "quota_exceeded") {
             answer.innerText = getTranslation("quotaExceeded");
         } else {
