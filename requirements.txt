@@ -43,3 +43,6 @@ waitress==3.0.2
 pytest==9.1.1
 deep_translator
 numpy
+sentence_transformers
+faiss_cpu
+torch
