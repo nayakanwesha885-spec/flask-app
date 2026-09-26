@@ -9,7 +9,7 @@ const translations = {
         askLabel: "Ask TATVA",
         questionPlaceholder: "Example: What are the requirements for patenting an Ayurvedic invention in India?",
         knowledgeBaseNote: "Answers are generated using the TATVA knowledge base.",
-        safetyNote: "For educational guidance only. This service does not replace a qualified legal or healthcare professional.",
+        safetyNote: "",
         askButton: "Ask TATVA",
         searchingMessage: "Searching TATVA knowledge base...",
         responseLabel: "TATVA RESPONSE",
@@ -46,7 +46,7 @@ const translations = {
         askLabel: "TATVA से पूछें",
         questionPlaceholder: "उदाहरण: भारत में आयुर्वेदिक आविष्कार का पेटेंट कराने की आवश्यकताएँ क्या हैं?",
         knowledgeBaseNote: "उत्तर TATVA ज्ञान आधार का उपयोग करके तैयार किए जाते हैं।",
-        safetyNote: "केवल शैक्षिक मार्गदर्शन के लिए। यह सेवा योग्य कानूनी या स्वास्थ्य पेशेवर का विकल्प नहीं है।",
+        safetyNote: "",
         askButton: "TATVA से पूछें",
         searchingMessage: "TATVA ज्ञान आधार में खोज जारी है...",
         responseLabel: "TATVA का उत्तर",
@@ -78,7 +78,7 @@ const translations = {
         askLabel: "TATVA କୁ ପଚାରନ୍ତୁ",
         questionPlaceholder: "ଉଦାହରଣ: ଭାରତରେ ଆୟୁର୍ବେଦିକ ଉଦ୍ଭାବନ ପାଇଁ ପେଟେଣ୍ଟ ଆବଶ୍ୟକତା କ’ଣ?",
         knowledgeBaseNote: "ଉତ୍ତରଗୁଡ଼ିକ TATVA ଜ୍ଞାନ ଆଧାର ବ୍ୟବହାର କରି ପ୍ରସ୍ତୁତ ହୁଏ।",
-        safetyNote: "କେବଳ ଶିକ୍ଷାମୂଳକ ମାର୍ଗଦର୍ଶନ ପାଇଁ। ଏହି ସେବା ଯୋଗ୍ୟ ଆଇନ କିମ୍ବା ସ୍ୱାସ୍ଥ୍ୟ ବିଶେଷଜ୍ଞଙ୍କ ବିକଳ୍ପ ନୁହେଁ।",
+        safetyNote: "",
         askButton: "TATVA କୁ ପଚାରନ୍ତୁ",
         searchingMessage: "TATVA ଜ୍ଞାନ ଆଧାରରେ ଖୋଜା ଚାଲିଛି...",
         responseLabel: "TATVA ଉତ୍ତର",
@@ -275,29 +275,14 @@ const domainHintTerms = [
     "abs", "intellectual property", "ipr", "invention", "inventor", "medicine",
     "medicinal", "herbal", "traditional knowledge", "traditional"
 ];
+const documentReferenceTerms = ["pdf", "document", "documents", "uploaded file", "uploaded files"];
 
 function detectUnsafeRequest(question) {
-    const normalized = question.trim().toLowerCase().replace(/[^a-z0-9\s]/g, " ").replace(/\s+/g, " ");
-    if (!normalized) {
-        return false;
-    }
-
-    return unsafeRequestTerms.some(function (term) {
-        return normalized.includes(term);
-    });
+    return false;
 }
 
 function detectIrrelevantRequest(question) {
-    const normalized = question.trim().toLowerCase().replace(/[^a-z0-9\s]/g, " ").replace(/\s+/g, " ");
-    if (!normalized) {
-        return true;
-    }
-
-    const matchedHints = domainHintTerms.filter(function (term) {
-        return normalized.includes(term);
-    });
-
-    return matchedHints.length === 0;
+    return false;
 }
 
 function getTranslation(key) {
@@ -436,18 +421,6 @@ async function askQuestion() {
         return;
     }
 
-    if (detectUnsafeRequest(question)) {
-        answer.innerText = "I cannot provide medical treatment, dosing, emergency, toxic, harmful, illegal manufacturing, fraud, or law-evasion instructions. I can help with lawful, educational information about Ayurveda intellectual property, traditional knowledge, and regulatory questions. Please consult a qualified professional or the relevant authority.";
-        document.getElementById("sources").innerHTML = "";
-        return;
-    }
-
-    if (detectIrrelevantRequest(question)) {
-        answer.innerText = "This service is limited to Ayurveda, traditional knowledge, intellectual property, and regulatory questions. Please ask a relevant question within those topics.";
-        document.getElementById("sources").innerHTML = "";
-        return;
-    }
-
     answer.innerText = getTranslation("thinking");
     setLoadingState(true);
     askButton.disabled = true;
@@ -464,7 +437,7 @@ async function askQuestion() {
 
             body: JSON.stringify({
                 question: question,
-                language: selectedLanguage,
+                language: document.getElementById("language").value,
                 topic: document.getElementById("topic").value
             })
         });
@@ -504,8 +477,6 @@ async function askQuestion() {
 
         if (error.code === "insufficient_quota") {
             answer.innerText = "Your OpenAI account has no API credits remaining. Add billing credits, restart Flask, and try again.";
-        } else if (error.status === 429 && (error.message || "").toLowerCase().includes("too many irrelevant")) {
-            answer.innerText = error.message || "Too many irrelevant requests in a short time. This service is limited to Ayurveda, traditional knowledge, intellectual property, and regulatory questions.";
         } else if (error.status === 429 || error.code === "quota_exceeded") {
             answer.innerText = getTranslation("quotaExceeded");
         } else {
@@ -713,6 +684,8 @@ showSection(window.location.hash.slice(1) || "home", false);
 
 document.getElementById("language").addEventListener("change", function (event) {
     selectedLanguage = event.target.value;
+    document.getElementById("answer").innerText = "";
+    document.getElementById("sources").innerHTML = "";
     updateInterface();
 });
 

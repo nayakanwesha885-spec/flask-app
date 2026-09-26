@@ -1,62 +1,42 @@
-from openai import OpenAI
-from dotenv import load_dotenv
 import os
-import time
+os.environ["HF_HUB_DISABLE_SYMLINKS"] = "1"
 
-load_dotenv()
+import pickle
+import numpy as np
+from pypdf import PdfReader
+from sentence_transformers import SentenceTransformer
 
-client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+# 1. Load free local embedding model (downloads automatically on first run ~90MB)
+model = SentenceTransformer('all-MiniLM-L6-v2', cache_folder='./model_cache')
 
-# Create the VIDHIVEDA knowledge store
-store = client.vector_stores.create(name="VIDHIVEDA Knowledge Base")
+def load_and_chunk_pdfs(folder_path="knowledge_base"):
+    chunks = []
+    # Walk through main folder and subfolders (ayurvedic_guidelines, patent, etc.)
+    for root, dirs, files in os.walk(folder_path):
+        for file in files:
+            if file.lower().endswith(".pdf"):
+                pdf_path = os.path.join(root, file)
+                print(f"Processing: {pdf_path}")
+                try:
+                    reader = PdfReader(pdf_path)
+                    for page in reader.pages:
+                        text = page.extract_text()
+                        if text:
+                            for paragraph in text.split("\n\n"):
+                                if len(paragraph.strip()) > 30:
+                                    chunks.append(paragraph.strip())
+                except Exception as e:
+                    print(f"Error reading {pdf_path}: {e}")
+    return chunks
 
-print("\nKnowledge store created:")
-print(store.name)
+print("Extracting text from knowledge_base...")
+chunks = load_and_chunk_pdfs()
 
-# Find all PDFs inside knowledge_base
-pdf_files = []
+print(f"Extracted {len(chunks)} text chunks. Generating embeddings...")
+embeddings = model.encode(chunks, show_progress_bar=True)
 
-for root, dirs, files in os.walk("knowledge_base"):
-    for file in files:
-        if file.lower().endswith(".pdf"):
-            pdf_files.append(os.path.join(root, file))
+# 2. Save chunks and embeddings locally
+with open("vector_store.pkl", "wb") as f:
+    pickle.dump({"chunks": chunks, "embeddings": embeddings}, f)
 
-print(f"\nFound {len(pdf_files)} PDF file(s).")
-
-# Upload each PDF
-for pdf in pdf_files:
-
-    print("\nUploading:")
-    print(pdf)
-
-    with open(pdf, "rb") as file_handle:
-        uploaded = client.files.create(file=file_handle, purpose="assistants")
-
-    operation = client.vector_stores.files.create(
-        vector_store_id=store.id,
-        file_id=uploaded.id
-    )
-
-    while operation.status not in {"completed", "failed", "cancelled"}:
-        time.sleep(3)
-        operation = client.vector_stores.files.retrieve(
-            vector_store_id=store.id,
-            file_id=uploaded.id
-        )
-
-    if operation.status != "completed":
-        raise RuntimeError(f"Failed to index {pdf}: {operation.status}")
-
-    print("Uploaded successfully!")
-
-# Save the store name into .env
-with open(".env", "a") as env_file:
-    env_file.write(
-        f"\nOPENAI_VECTOR_STORE_ID={store.id}\n"
-    )
-
-print("\n================================")
-print("VIDHIVEDA KNOWLEDGE BASE READY")
-print("================================")
-print("Store:", store.name)
-print(f"Total PDFs: {len(pdf_files)}")
+print(f"Successfully saved vector store to vector_store.pkl!")

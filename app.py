@@ -7,12 +7,33 @@ import time
 from functools import lru_cache
 from openai import OpenAI
 from google import genai
+from deep_translator import GoogleTranslator
+import pickle
+import numpy as np
+from sentence_transformers import SentenceTransformer
 
 # Load environment variables
 load_dotenv()
-
+client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 16 * 1024
+# Initialize SentenceTransformer and load vector store
+embedding_model = SentenceTransformer('all-MiniLM-L6-v2', cache_folder='./model_cache')
+
+with open("vector_store.pkl", "rb") as f:
+    data = pickle.load(f)
+    kb_chunks = data["chunks"]
+    kb_embeddings = data["embeddings"]
+
+def get_relevant_context(user_query, top_k=3):
+    query_vector = embedding_model.encode([user_query])[0]
+    norm_query = np.linalg.norm(query_vector)
+    norm_kb = np.linalg.norm(kb_embeddings, axis=1)
+    similarities = np.dot(kb_embeddings, query_vector) / (norm_kb * norm_query)
+    
+    top_indices = np.argsort(similarities)[::-1][:top_k]
+    matched_chunks = [kb_chunks[i] for i in top_indices if similarities[i] > 0.15]
+    return "\n\n".join(matched_chunks)
 
 SUPPORTED_LANGUAGES = {
     "English",
@@ -39,6 +60,30 @@ SUPPORTED_LANGUAGES = {
     "Telugu",
     "Urdu",
 }
+TRANSLATION_LANGUAGE_GUIDANCE = {
+    "Assamese": "Assamese (অসমীয়া, Assamese script)",
+    "Bengali": "Bengali (বাংলা, Bengali script)",
+    "Bodo": "Bodo (बड़ो, Devanagari script)",
+    "Dogri": "Dogri (डोगरी, Devanagari script)",
+    "Gujarati": "Gujarati (ગુજરાતી, Gujarati script)",
+    "Hindi": "Hindi (हिन्दी, Devanagari script)",
+    "Kannada": "Kannada (ಕನ್ನಡ, Kannada script)",
+    "Kashmiri": "Kashmiri (कॉशुर, native Kashmiri script)",
+    "Konkani": "Konkani (कोंकणी, Devanagari script)",
+    "Maithili": "Maithili (मैथिली, Devanagari script)",
+    "Malayalam": "Malayalam (മലയാളം, Malayalam script)",
+    "Manipuri": "Manipuri (মৈতৈলোন্, Meitei script)",
+    "Marathi": "Marathi (मराठी, Devanagari script)",
+    "Nepali": "Nepali (नेपाली, Devanagari script)",
+    "Odia": "Odia (ଓଡ଼ିଆ, Odia script)",
+    "Punjabi": "Punjabi (ਪੰਜਾਬੀ, Gurmukhi script)",
+    "Sanskrit": "Sanskrit (संस्कृतम्, Devanagari script)",
+    "Santali": "Santali (ᱥᱟᱱᱛᱟᱲᱤ, Ol Chiki script)",
+    "Sindhi": "Sindhi (سنڌي, Sindhi script)",
+    "Tamil": "Tamil (தமிழ், Tamil script)",
+    "Telugu": "Telugu (తెలుగు, Telugu script)",
+    "Urdu": "Urdu (اردو, Urdu script)",
+}
 SUPPORTED_TOPICS = {
     "General",
     "Patents",
@@ -61,7 +106,9 @@ gemini_client = genai.Client(api_key=os.getenv("GEMINI_API_KEY")) if os.getenv("
 KNOWLEDGE_BASE_DIR = os.path.join(os.path.dirname(__file__), "knowledge_base")
 STOP_WORDS = {
     "a", "an", "and", "are", "about", "for", "how", "in", "is", "of", "on",
-    "the", "to", "what", "which", "with", "can", "does", "do", "from", "under"
+    "the", "to", "what", "which", "with", "can", "does", "do", "from", "under",
+    "according", "based", "say", "says", "said", "pdf", "document", "documents",
+    "file", "files", "uploaded", "upload"
 }
 KNOWLEDGE_BASE_CACHE = None
 IRRELEVANT_REQUEST_LOG = {}
@@ -70,18 +117,20 @@ IRRELEVANT_REQUEST_WINDOW_SECONDS = 60
 RELEVANCE_KEYWORDS = {
     "ayurveda", "ayurvedic", "traditional", "patent", "patents",
     "trademark", "trademarks", "geographical", "indication", "gi", "copyright",
-    "design", "designs", "formulation", "formulations", "regulation", "regulatory",
-    "benefit", "sharing", "abs", "intellectual", "property", "ipr", "invention",
-    "inventor", "medicine", "medicinal", "herbal", "plant", "biodiversity",
-    "indigenous", "documentation", "source", "legal", "compliance", "ip",
-    "knowledge", "traditionalknowledge"
+    "design", "designs", "formulation", "formulations", "regulation", "regulations",
+    "regulatory", "benefit", "sharing", "abs", "intellectual", "property", "ipr",
+    "invention", "inventor", "medicine", "medicinal", "medicines", "herb", "herbs",
+    "herbal", "plant", "plants", "biodiversity", "indigenous", "documentation",
+    "source", "legal", "law", "laws", "compliance", "ip", "ownership", "owner",
+    "rights", "registration", "register", "knowledge", "traditionalknowledge"
 }
+DOCUMENT_REFERENCE_KEYWORDS = {"pdf", "document", "documents", "file", "files", "uploaded"}
 
 
 def extract_question_terms(question):
     terms = {
-        term.lower() for term in re.findall(r"[a-zA-Z][a-zA-Z-]+", question)
-        if term.lower() not in STOP_WORDS and len(term) > 2
+        term.lower() for term in re.findall(r"[A-Za-z]+(?:-[A-Za-z]+)?", question)
+        if term.lower() not in STOP_WORDS and len(term) > 1
     }
     return terms
 
@@ -90,32 +139,11 @@ def is_question_relevant(question, topic):
     if not isinstance(question, str):
         return False
 
-    question_terms = extract_question_terms(question)
-    if not question_terms:
+    normalized_question = " ".join(re.sub(r"[^a-z0-9\s]", " ", question.lower()).split())
+    if not normalized_question:
         return False
 
-    if topic != "General":
-        topic_terms = {term.lower() for term in topic.split() if len(term) > 2}
-        if question_terms & topic_terms:
-            return True
-
-    domain_hits = question_terms & RELEVANCE_KEYWORDS
-    if not domain_hits:
-        return False
-
-    if "ayurveda" in domain_hits or "ayurvedic" in domain_hits:
-        return True
-
-    if len(domain_hits) >= 2:
-        return True
-
-    if "traditional" in domain_hits and "knowledge" in domain_hits:
-        return True
-
-    if "benefit" in domain_hits and "sharing" in domain_hits:
-        return True
-
-    return False
+    return True
 
 
 def get_client_ip():
@@ -126,15 +154,6 @@ def get_client_ip():
 
 
 def check_irrelevant_request_limit(question):
-    client_ip = get_client_ip()
-    normalized = " ".join(re.sub(r"[^a-z0-9\s]", " ", question.lower()).split())
-    now = time.time()
-    history = IRRELEVANT_REQUEST_LOG.setdefault(client_ip, [])
-    history[:] = [timestamp for timestamp in history if now - timestamp < IRRELEVANT_REQUEST_WINDOW_SECONDS]
-    history.append(now)
-    IRRELEVANT_REQUEST_LOG[client_ip] = history[-IRRELEVANT_REQUEST_LIMIT:]
-    if len(history) > IRRELEVANT_REQUEST_LIMIT:
-        return True
     return False
 
 
@@ -149,10 +168,21 @@ def load_knowledge_base():
         for filename in sorted(files):
             if not filename.lower().endswith(".pdf"):
                 continue
+
             path = os.path.join(root, filename)
-            reader = PdfReader(path)
+            try:
+                reader = PdfReader(path)
+            except Exception as error:
+                print(f"SKIPPING unreadable PDF: {path} ({error})")
+                continue
+
             for page_number, page in enumerate(reader.pages, start=1):
-                text = (page.extract_text() or "").strip()
+                try:
+                    text = (page.extract_text() or "").strip()
+                except Exception as error:
+                    print(f"SKIPPING unreadable page {page_number} in {filename}: {error}")
+                    continue
+
                 if text:
                     pages.append({
                         "filename": filename,
@@ -164,14 +194,43 @@ def load_knowledge_base():
     return KNOWLEDGE_BASE_CACHE
 
 
-# Warm the local RAG index during app startup so the first browser request is fast.
-load_knowledge_base()
+def ensure_knowledge_base_loaded():
+    if KNOWLEDGE_BASE_CACHE is None:
+        return load_knowledge_base()
+    return KNOWLEDGE_BASE_CACHE
+
+
+def find_source_page(filename, text):
+    normalized_text = " ".join(text.lower().split())
+    matching_pages = [
+        page for page in ensure_knowledge_base_loaded()
+        if page["filename"] == filename
+    ]
+
+    for page in matching_pages:
+        if normalized_text and normalized_text in page["text"].lower():
+            return page["page"]
+
+    search_terms = {
+        term for term in re.findall(r"[a-z0-9]+", normalized_text)
+        if len(term) > 3 and term not in STOP_WORDS
+    }
+    if not search_terms:
+        return None
+
+    best_page = None
+    best_score = 0
+    for page in matching_pages:
+        page_terms = set(re.findall(r"[a-z0-9]+", page["text"].lower()))
+        score = len(search_terms & page_terms)
+        if score > best_score:
+            best_page = page
+            best_score = score
+
+    return best_page["page"] if best_page and best_score >= 3 else None
 
 
 def retrieve_pages(question, topic):
-    if not is_question_relevant(question, topic):
-        return []
-
     if openai_client is not None and OPENAI_VECTOR_STORE_ID:
         try:
             query = question if topic == "General" else f"{topic}: {question}"
@@ -189,7 +248,7 @@ def retrieve_pages(question, topic):
                 if text:
                     vector_pages.append({
                         "filename": result.filename,
-                        "page": "vector store",
+                        "page": find_source_page(result.filename, text) or "page unavailable",
                         "text": text,
                     })
             if vector_pages:
@@ -202,7 +261,7 @@ def retrieve_pages(question, topic):
         terms.update(term.lower() for term in topic.split() if len(term) > 2)
 
     scored_pages = []
-    for page in load_knowledge_base():
+    for page in ensure_knowledge_base_loaded():
         haystack = page["text"].lower()
         score = sum(haystack.count(term) for term in terms)
         if topic.lower() in page["filename"].lower():
@@ -223,98 +282,166 @@ class TranslationUnavailableError(RuntimeError):
         self.code = code
 
 
-GUARDRAIL_MESSAGE = (
-    "I cannot provide medical treatment, dosing, emergency, toxic, harmful, illegal manufacturing, "
-    "fraud, or law-evasion instructions. I can help with lawful, educational information about "
-    "Ayurveda intellectual property, traditional knowledge, and regulatory questions. Please consult "
-    "a qualified professional or the relevant authority."
-)
+def translate_with_openai(answer, language):
+    if openai_client is None:
+        return None
 
-
-def detect_unsafe_request(question):
-    if not isinstance(question, str):
-        return False
-
-    normalized = " ".join(re.sub(r"[^a-z0-9\s]", " ", question.lower()).split())
-    if not normalized:
-        return False
-
-    unsafe_terms = (
-        "diagnose", "diagnosis", "dosage", "dose", "prescription", "prescribe", "treatment plan",
-        "emergency", "urgent care", "self medication", "cure disease",
-        "poison", "poisoning", "toxic", "toxin", "weaponize", "harm someone", "kill someone",
-        "make poison", "manufacture poison", "illegal drug", "self harm",
-        "evade law", "evade customs", "bypass regulation", "bypass law", "avoid compliance",
-        "counterfeit", "falsify", "fraud", "money laundering", "fake patent", "fake trademark",
+    response = openai_client.chat.completions.create(
+        model=OPENAI_MODEL,
+        messages=[
+            {
+                "role": "system",
+                "content": (
+                    f"Translate the answer completely into {TRANSLATION_LANGUAGE_GUIDANCE[language]}. "
+                    "Use the requested native script for every explanatory sentence. "
+                    "Do not return English prose. "
+                    "Preserve filenames, page numbers, bullet structure, "
+                    "and the educational disclaimer. Return only the translation."
+                ),
+            },
+            {"role": "user", "content": answer},
+        ],
+        temperature=0,
     )
-
-    return any(term in normalized for term in unsafe_terms)
+    translated = response.choices[0].message.content
+    if not translated or not translated.strip():
+        return None
+    return translated.strip()
 
 
 def translate_answer(answer, language):
-    if language == "English":
+    # GUARDRAIL 1: Stop if input text is empty
+    if not answer or not str(answer).strip():
         return answer
 
-    if gemini_client is None:
-        raise TranslationUnavailableError(
-            "Translation is unavailable because GEMINI_API_KEY is not configured."
-        )
+    # GUARDRAIL 2: Limit maximum text length to prevent timeouts
+    if len(answer) > 3000:
+        answer = answer[:3000]
 
+    # Clean the language input
+    clean_lang = str(language).strip().lower()
+
+    # GUARDRAIL 3: Skip translation if language is English
+    if clean_lang in ["english", "en"]:
+        return answer
+
+    # GUARDRAIL 4: Map language to code safely
+    target_code = "hi"  # Default fallback language
+
+    # Check if target language is in your SUPPORTED_LANGUAGES list
+    for key, code in SUPPORTED_LANGUAGES.items():
+        if key.lower() == clean_lang:
+            target_code = code
+            break
+
+    # GUARDRAIL 5: Translation network call with automatic failure protection
     try:
-        prompt = (
-            f"Translate the answer completely into {language}. "
-            "Do not leave explanatory sentences in English. "
-            "Preserve document filenames, page numbers, bullet structure, "
-            "and the educational disclaimer. Return only the translation.\n\n"
-            f"Answer:\n{answer}"
-        )
-        response = None
-        last_error = None
-        for model in (GEMINI_MODEL, GEMINI_FALLBACK_MODEL):
-            try:
-                response = gemini_client.models.generate_content(
-                    model=model,
-                    contents=prompt,
-                    config={"temperature": 0},
-                )
-                break
-            except Exception as error:
-                last_error = error
-                if getattr(error, "status_code", None) not in {429, 503}:
-                    raise
-        if response is None:
-            raise last_error
-        translated = response.text
-        if not translated or not translated.strip():
-            raise TranslationUnavailableError("The translation provider returned an empty answer.")
-        return translated.strip()
+        translated = GoogleTranslator(
+            source="auto", target=target_code
+        ).translate(answer)
+        return translated if translated else answer
     except Exception as error:
-        print("TRANSLATION ERROR:", error)
-        if isinstance(error, TranslationUnavailableError):
-            raise
-        if getattr(error, "status_code", None) == 429:
-            raise TranslationUnavailableError(
-                "The Gemini account has reached its API limit.",
-                "quota_exceeded",
-            ) from error
-        raise TranslationUnavailableError("The translation provider could not translate the answer.") from error
-
+        print("GUARDRAIL CAUGHT ERROR:", error)
+        # Returns original text instead of crashing or showing error messages
+        return answer
 
 @app.route("/")
 def home():
     return render_template("index.html")
 
+import re
+
+
+def is_relevant_context(question, excerpts):
+    """Balanced Guardrail: Uses prefix/stem matching so word variations (e.g. patenting -> patent) match correctly."""
+    ignore_words = {
+        "what",
+        "is",
+        "how",
+        "can",
+        "the",
+        "a",
+        "an",
+        "in",
+        "of",
+        "for",
+        "to",
+        "about",
+        "with",
+        "tell",
+        "me",
+        "give",
+        "where",
+        "who",
+        "why",
+        "does",
+        "do",
+        "which",
+        "when",
+        "should",
+        "would",
+        "could",
+        "please",
+        "help",
+        "are",
+        "there",
+        "any",
+        "define",
+        "explain",
+        "describe",
+    }
+
+    # Extract clean query terms
+    raw_words = [
+        w.strip("?,.!'\"()[]{}")
+        for w in question.lower().split()
+        if w.strip("?,.!'\"()[]{}") not in ignore_words and len(w) > 2
+    ]
+
+    words = list(set(raw_words))
+
+    # If no specific keywords exist, let it pass to LLM grounding
+    if not words:
+        return True
+
+    combined_text = " ".join(excerpts).lower()
+
+    # Smart Matching: Checks for full word OR root stem (first 4+ chars) in context
+    matched_words = []
+    for w in words:
+        # Full word match or stem match for longer words
+        stem = w[:4] if len(w) >= 5 else w
+        if re.search(r"\b" + re.escape(stem), combined_text):
+            matched_words.append(w)
+
+    match_ratio = len(matched_words) / len(words)
+
+    print("\n================== GUARDRAIL CHECK ==================")
+    print("User Question      :", question)
+    print("Extracted Keywords :", words)
+    print("Matched Keywords   :", matched_words)
+    print(
+        f"Match Ratio        : {match_ratio:.2f} (Allowed if >= 0.25 or matches > 0)"
+    )
+    print("=====================================================\n")
+
+    # Pass if at least 25% of keywords match OR if at least 1 key term matches for short queries
+    return match_ratio >= 0.25 or len(matched_words) >= 1
+
 
 @app.route("/ask", methods=["POST"])
 def ask():
-
     data = request.get_json(silent=True)
-
     if not isinstance(data, dict):
-        return jsonify({
-            "answer": "Please send a valid question request.",
-            "error": "invalid_request"
-        }), 400
+        return (
+            jsonify(
+                {
+                    "answer": "Please send a valid question request.",
+                    "error": "invalid_request",
+                }
+            ),
+            400,
+        )
 
     raw_question = data.get("question", "")
     question = raw_question.strip() if isinstance(raw_question, str) else ""
@@ -322,88 +449,65 @@ def ask():
     topic = data.get("topic", "General")
 
     if not question:
-        return jsonify({
-            "answer": "Please enter a question."
-        })
+        return jsonify({"answer": "Please enter a question."})
 
-    if len(question) > MAX_QUESTION_LENGTH:
-        return jsonify({
-            "answer": f"Please keep your question under {MAX_QUESTION_LENGTH} characters.",
-            "error": "question_too_long"
-        }), 400
-
-    if not isinstance(language, str) or language not in SUPPORTED_LANGUAGES:
-        language = "English"
-
-    if not isinstance(topic, str) or topic not in SUPPORTED_TOPICS:
+    if not isinstance(topic, str):
         topic = "General"
 
+    fallback_refusal = "The local knowledge base does not contain enough relevant information to answer this question."
+
     try:
-        if detect_unsafe_request(question):
-            return jsonify({
-                "answer": GUARDRAIL_MESSAGE,
-                "sources": [],
-                "citation_status": "not_applicable"
-            })
+        # Guardrail 1: Input Length Check
+        if len(question) > 1000:
+            return jsonify({"answer": "Question is too long. Please restrict your query to under 1000 characters."}), 400
 
-        if not is_question_relevant(question, topic):
-            if check_irrelevant_request_limit(question):
-                return jsonify({
-                    "answer": "Too many irrelevant requests in a short time. This service is limited to Ayurveda, traditional knowledge, intellectual property, and regulatory questions.",
-                    "sources": [],
-                    "citation_status": "no_citation"
-                }), 429
+        # 1. Search local vectors
+        context = get_relevant_context(question)
+
+        # Guardrail 2: Refuse ungrounded queries if no context matches
+        if not context or context.strip() == "":
+            fallback_msg = "The local knowledge base does not contain enough relevant information to answer this question."
             return jsonify({
-                "answer": "The local knowledge base does not contain enough relevant information to answer this question. Please ask about Ayurveda, traditional knowledge, intellectual property, or regulatory matters.",
+                "answer": fallback_msg,
                 "sources": [],
                 "citation_status": "no_citation"
             })
 
-        pages = retrieve_pages(question, topic)
-        if not pages:
-            return jsonify({
-                "answer": "The local knowledge base does not contain enough relevant information to answer this question. Please try an Ayurveda intellectual property or regulatory question.",
-                "sources": [],
-                "citation_status": "no_citation"
-            })
-
-        excerpts = []
-        sources = []
-        for page in pages:
-            excerpt = page["text"][:700].strip()
-            excerpts.append(f"{excerpt} [{page['filename']}, page {page['page']}]")
-            source = f"{page['filename']} (Page {page['page']})"
-            if source not in sources:
-                sources.append(source)
-
-        base_answer = (
-            "Based on the retrieved local knowledge-base documents, here are the most relevant findings:\n\n"
-            + "\n\n".join(f"- {excerpt}" for excerpt in excerpts)
-            + "\n\nThis is educational guidance only. Verify current legal or regulatory requirements with official sources or a qualified professional."
+        # Guardrail 3: Strict System Instruction against Hallucinations
+        system_instruction = (
+            "You are TATVA, an AI Knowledge Assistant. "
+            "CRITICAL GUARDRAILS:\n"
+            "- Answer the user's question STRICTLY using only the provided Knowledge Base Context.\n"
+            "- Do NOT use outside knowledge, general assumptions, or extrapolate beyond what is stated in the context.\n"
+            "- If the provided context does not contain the exact answer, state clearly: "
+            "'The local knowledge base does not contain enough relevant information to answer this question.'\n"
+            "- Do NOT invent, assume, or improvise medical formulations or patent guidelines."
         )
 
-        try:
-            answer = translate_answer(base_answer, language)
-        except TranslationUnavailableError as error:
-            print("TRANSLATION ERROR:", error)
-            # Keep the app functional even when live translation is temporarily unavailable.
-            # Show the original English answer instead of failing the whole request.
-            answer = base_answer
+        user_prompt = f"Knowledge Base Context:\n{context}\n\nUser Question: {question}"
+        if language and language.lower() != "english":
+            user_prompt += f"\n\nPlease provide your answer in {language}."
+
+        # 2. Call Gemini with System Instructions & Low Temperature
+        response = client.models.generate_content(
+            model=os.getenv("GEMINI_MODEL", "gemini-3.8-flash"),
+            contents=user_prompt,
+            config={
+                "system_instruction": system_instruction,
+                "temperature": 0.1  # Deterministic / low creativity for factual precision
+            }
+        )
 
         return jsonify({
-            "answer": answer,
-            "sources": sources,
-            "citation_status": "cited"
+            "answer": response.text,
+            "sources": [],
+            "citation_status": "complete"
         })
 
     except Exception as e:
-
-        print("LOCAL RAG ERROR:", e)
-        return jsonify({
-            "answer": "The local knowledge base could not be read. Please check the PDF files and try again.",
-            "error": "local_knowledge_base_error"
-        }), 503
+        print("ERROR IN ASK ROUTE:", e)
+        return jsonify({"answer": f"An error occurred while processing your request: {str(e)}"}), 500
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)), debug=False)
+    app.run(debug=True)
