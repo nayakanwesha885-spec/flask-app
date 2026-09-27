@@ -453,25 +453,38 @@ async function askQuestion() {
 
         answer.innerText = data.answer || getTranslation("noAnswer");
 
-        const sources = document.getElementById("sources");
-        sources.innerHTML = "";
-        const sourceHeading = document.createElement("strong");
-        sourceHeading.textContent = getTranslation("sourcesHeading");
-        sources.appendChild(sourceHeading);
+const sources = document.getElementById("sources");
+if (sources) {
+    sources.innerHTML = "";
 
-        if (Array.isArray(data.sources) && data.sources.length > 0) {
-            const sourceList = document.createElement("ul");
-            data.sources.forEach(function (source) {
-                const item = document.createElement("li");
+    const sourceHeading = document.createElement("strong");
+    sourceHeading.textContent = getTranslation("sourcesHeading") || "SOURCES";
+    sources.appendChild(sourceHeading);
+
+    if (Array.isArray(data.sources) && data.sources.length > 0) {
+        const sourceList = document.createElement("ul");
+
+        data.sources.forEach(function (source) {
+            const item = document.createElement("li");
+
+            if (typeof source === 'object' && source !== null) {
+                const name = source.filename || source.title || source.doc_id || "Document";
+                const page = source.page ? ` (Page ${source.page})` : "";
+                item.textContent = `${name}${page}`;
+            } else {
                 item.textContent = source;
-                sourceList.appendChild(item);
-            });
-            sources.appendChild(sourceList);
-        } else {
-            const noCitation = document.createElement("p");
-            noCitation.textContent = getTranslation("noCitation");
-            sources.appendChild(noCitation);
-        }
+            }
+
+            sourceList.appendChild(item);
+        });
+
+        sources.appendChild(sourceList);
+    } else {
+        const nocitation = document.createElement("p");
+        nocitation.textContent = getTranslation("nocitation") || "No specific sources cited.";
+        sources.appendChild(nocitation);
+    }
+}
 
     } catch (error) {
 

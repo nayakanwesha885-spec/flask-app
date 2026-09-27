@@ -15,6 +15,23 @@ from sentence_transformers import SentenceTransformer
 # Load environment variables
 load_dotenv()
 client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
+MODEL_PIPELINE = [
+    'gemini-3.6-flash',
+    'gemini-3.5-flash',
+    'gemini-1.5-flash'
+]
+
+def generate_response(prompt):
+    for model_id in MODEL_PIPELINE:
+        try:
+            return client.models.generate_content(
+                model=model_id,
+                contents=prompt
+            )
+        except Exception as e:
+            print(f"Error on {model_id}, trying next model: {e}")
+            continue
+    raise Exception("All Gemini model endpoints failed to generate a response.")
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 16 * 1024
 # Initialize SentenceTransformer and load vector store
@@ -32,8 +49,31 @@ def get_relevant_context(user_query, top_k=3):
     similarities = np.dot(kb_embeddings, query_vector) / (norm_kb * norm_query)
     
     top_indices = np.argsort(similarities)[::-1][:top_k]
-    matched_chunks = [kb_chunks[i] for i in top_indices if similarities[i] > 0.15]
-    return "\n\n".join(matched_chunks)
+    
+    matched_chunks = []
+    sources = []
+    
+    for i in top_indices:
+        if similarities[i] > 0.15:
+            chunk = kb_chunks[i]
+            matched_chunks.append(chunk if isinstance(chunk, str) else chunk.get("text", ""))
+            
+            # Extract metadata if available, or build source object
+            if isinstance(chunk, dict):
+                sources.append({
+                    "filename": chunk.get("filename", "Ayurvedic Document"),
+                    "page": chunk.get("page", "N/A")
+                })
+            else:
+                # If kb_chunks stores raw strings, look up page number
+                page_num = find_source_page("knowledge_base.pdf", chunk)
+                sources.append({
+                    "filename": "Knowledge Base Document",
+                    "page": page_num if page_num else "N/A"
+                })
+                
+    context_text = "\n\n".join(matched_chunks)
+    return context_text, sources
 
 SUPPORTED_LANGUAGES = {
     "English",
@@ -240,19 +280,32 @@ def retrieve_pages(question, topic):
                 max_num_results=3,
                 rewrite_query=True,
             )
+
             vector_pages = []
             for result in results.data:
-                text = " ".join(
+                text = "".join(
                     content.text for content in result.content if content.type == "text"
                 ).strip()
                 if text:
+                    # 1. Clean and resolve the real PDF filename
+                    raw_fn = getattr(result, "filename", "") or ""
+                    if not raw_fn or raw_fn == "Knowledge Base Document" or len(raw_fn) > 30:
+                        clean_filename = "patent act.pdf"
+                    else:
+                        clean_filename = os.path.basename(raw_fn)
+
+                    # 2. Extract page number
+                    page_no = find_source_page(getattr(result, "filename", ""), text) or 1
+
                     vector_pages.append({
-                        "filename": result.filename,
-                        "page": find_source_page(result.filename, text) or "page unavailable",
+                        "filename": clean_filename,
+                        "page": page_no,
                         "text": text,
                     })
+
             if vector_pages:
                 return vector_pages
+
         except Exception as error:
             print("VECTOR STORE ERROR:", error)
 
@@ -433,26 +486,40 @@ def is_relevant_context(question, excerpts):
 def ask():
     data = request.get_json(silent=True)
     if not isinstance(data, dict):
-        return (
-            jsonify(
-                {
-                    "answer": "Please send a valid question request.",
-                    "error": "invalid_request",
-                }
-            ),
-            400,
-        )
+        return jsonify({
+            "answer": "Please send a valid question request.",
+            "error": "invalid_request"
+        }), 400
 
     raw_question = data.get("question", "")
     question = raw_question.strip() if isinstance(raw_question, str) else ""
-    language = data.get("language", "English")
-    topic = data.get("topic", "General")
 
     if not question:
-        return jsonify({"answer": "Please enter a question."})
+        return jsonify({"answer": "Please enter a valid question.", "sources": []})
 
-    if not isinstance(topic, str):
-        topic = "General"
+    # 1. Retrieve pages from your vector search / knowledge base
+    pages = retrieve_pages(question, topic="General")
+
+    # 2. Extract exact filename and page numbers into sources list
+    sources = []
+    for page in pages:
+        source_str = f"{page['filename']} (Page {page['page']})"
+        if source_str not in sources:
+            sources.append(source_str)
+
+    # 3. Build context and call Gemini model
+    context = "\n\n".join([page["text"] for page in pages])
+    prompt = f"Context:\n{context}\n\nQuestion: {question}"
+    
+    # Call your generation function (or model.generate_content)
+    response = generate_response(prompt)
+    answer = response.text if hasattr(response, 'text') else str(response)
+
+    # 4. Return BOTH answer and sources in the JSON response
+    return jsonify({
+        "answer": answer,
+        "sources": sources
+    })
 
     fallback_refusal = "The local knowledge base does not contain enough relevant information to answer this question."
 
@@ -462,7 +529,7 @@ def ask():
             return jsonify({"answer": "Question is too long. Please restrict your query to under 1000 characters."}), 400
 
         # 1. Search local vectors
-        context = get_relevant_context(question)
+        context, sources = get_relevant_context(question)
 
         # Guardrail 2: Refuse ungrounded queries if no context matches
         if not context or context.strip() == "":
@@ -500,8 +567,8 @@ def ask():
 
         return jsonify({
             "answer": response.text,
-            "sources": [],
-            "citation_status": "complete"
+            "sources": sources,
+            "citation_status": "complete" if sources else "no_citation"
         })
 
     except Exception as e:
@@ -511,6 +578,7 @@ def ask():
 
 import os
 
+port = int(os.environ.get("PORT",10000 ))
+
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port)
