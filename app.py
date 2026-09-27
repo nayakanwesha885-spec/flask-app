@@ -4,101 +4,202 @@ from pypdf import PdfReader
 import os
 import re
 import time
+import pickle
 from functools import lru_cache
 from openai import OpenAI
 from google import genai
 from deep_translator import GoogleTranslator
-import pickle
 import numpy as np
-from sentence_transformers import SentenceTransformer
 
-# Load environment variables
+# ---------------------------------------------------------------------------
+# Environment
+# ---------------------------------------------------------------------------
 load_dotenv()
-client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
+
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+
+client = genai.Client(api_key=GEMINI_API_KEY)
+openai_client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
+
+# ---------------------------------------------------------------------------
+# Model pipeline — tries models in order until one succeeds
+# ---------------------------------------------------------------------------
 MODEL_PIPELINE = [
-    'gemini-3.6-flash',
-    'gemini-3.5-flash',
-    'gemini-1.5-flash'
+    "gemini-2.5-flash",
+    "gemini-2.0-flash",
+    "gemini-1.5-flash",
 ]
 
-def generate_response(prompt):
+EMBEDDING_MODEL = "text-embedding-004"   # Gemini free-tier embedding model
+
+def generate_response(prompt: str):
     for model_id in MODEL_PIPELINE:
         try:
-            return client.models.generate_content(
-                model=model_id,
-                contents=prompt
-            )
+            return client.models.generate_content(model=model_id, contents=prompt)
         except Exception as e:
-            print(f"Error on {model_id}, trying next model: {e}")
-            continue
-    raise Exception("All Gemini model endpoints failed to generate a response.")
+            print(f"[WARN] {model_id} failed: {e}")
+    raise RuntimeError("All Gemini model endpoints failed.")
+
+
+def embed_text(texts: list[str]) -> np.ndarray:
+    """
+    Embed a list of strings using the Gemini Embedding API.
+    Returns a (len(texts), dim) float32 ndarray.
+    Falls back to zero-vectors on error so startup never crashes.
+    """
+    vectors = []
+    for text in texts:
+        try:
+            result = client.models.embed_content(
+                model=EMBEDDING_MODEL,
+                contents=text,
+            )
+            vectors.append(result.embeddings[0].values)
+        except Exception as e:
+            print(f"[WARN] embed_text failed for chunk: {e}")
+            vectors.append([0.0] * 768)   # text-embedding-004 dim = 768
+    return np.array(vectors, dtype=np.float32)
+
+
+# ---------------------------------------------------------------------------
+# Flask app
+# ---------------------------------------------------------------------------
 app = Flask(__name__)
-app.config["MAX_CONTENT_LENGTH"] = 16 * 1024
-# Initialize SentenceTransformer and load vector store
-embedding_model = SentenceTransformer('all-MiniLM-L6-v2', cache_folder='./model_cache')
+app.config["MAX_CONTENT_LENGTH"] = 16 * 1024 * 1024   # 16 MB upload cap
 
-with open("vector_store.pkl", "rb") as f:
-    data = pickle.load(f)
-    kb_chunks = data["chunks"]
-    kb_embeddings = data["embeddings"]
+# ---------------------------------------------------------------------------
+# Vector store — built lazily from PDFs in knowledge_base/
+# If a pre-built vector_store.pkl exists it is loaded directly (for local dev).
+# On Render the pkl is NOT committed, so it is built from the PDFs at startup.
+# ---------------------------------------------------------------------------
+VECTOR_STORE_PATH = os.path.join(os.path.dirname(__file__), "vector_store.pkl")
+KNOWLEDGE_BASE_DIR = os.path.join(os.path.dirname(__file__), "knowledge_base")
 
-def get_relevant_context(user_query, top_k=3):
-    query_vector = embedding_model.encode([user_query])[0]
-    norm_query = np.linalg.norm(query_vector)
-    norm_kb = np.linalg.norm(kb_embeddings, axis=1)
-    similarities = np.dot(kb_embeddings, query_vector) / (norm_kb * norm_query)
-    
-    top_indices = np.argsort(similarities)[::-1][:top_k]
-    
-    matched_chunks = []
-    sources = []
-    
-    for i in top_indices:
-        if similarities[i] > 0.15:
-            chunk = kb_chunks[i]
-            matched_chunks.append(chunk if isinstance(chunk, str) else chunk.get("text", ""))
-            
-            # Extract metadata if available, or build source object
-            if isinstance(chunk, dict):
-                sources.append({
-                    "filename": chunk.get("filename", "Ayurvedic Document"),
-                    "page": chunk.get("page", "N/A")
-                })
-            else:
-                # If kb_chunks stores raw strings, look up page number
-                page_num = find_source_page("knowledge_base.pdf", chunk)
-                sources.append({
-                    "filename": "Knowledge Base Document",
-                    "page": page_num if page_num else "N/A"
-                })
-                
-    context_text = "\n\n".join(matched_chunks)
-    return context_text, sources
+_kb_chunks: list = []
+_kb_embeddings: np.ndarray | None = None
 
+
+def _chunk_text(text: str, chunk_size: int = 500, overlap: int = 50) -> list[str]:
+    """Split text into overlapping character-level chunks."""
+    chunks = []
+    start = 0
+    while start < len(text):
+        end = start + chunk_size
+        chunks.append(text[start:end].strip())
+        start += chunk_size - overlap
+    return [c for c in chunks if len(c) > 30]
+
+
+def _build_vector_store():
+    """Read all PDFs in knowledge_base/, chunk them, embed with Gemini."""
+    global _kb_chunks, _kb_embeddings
+
+    raw_chunks = []
+    for root, _, files in os.walk(KNOWLEDGE_BASE_DIR):
+        for filename in sorted(files):
+            if not filename.lower().endswith(".pdf"):
+                continue
+            path = os.path.join(root, filename)
+            print(f"[RAG] Processing PDF: {path}")
+            try:
+                reader = PdfReader(path)
+                for page_num, page in enumerate(reader.pages, start=1):
+                    text = (page.extract_text() or "").strip()
+                    if not text:
+                        continue
+                    text = re.sub(r"\s+", " ", text)
+                    for chunk in _chunk_text(text):
+                        raw_chunks.append({
+                            "text": chunk,
+                            "filename": filename,
+                            "page": page_num,
+                        })
+            except Exception as e:
+                print(f"[WARN] Skipping {path}: {e}")
+
+    if not raw_chunks:
+        print("[RAG] No PDF chunks found — vector store is empty.")
+        _kb_chunks = []
+        _kb_embeddings = np.empty((0, 768), dtype=np.float32)
+        return
+
+    print(f"[RAG] Embedding {len(raw_chunks)} chunks via Gemini API …")
+    texts = [c["text"] for c in raw_chunks]
+    embeddings = embed_text(texts)
+
+    _kb_chunks = raw_chunks
+    _kb_embeddings = embeddings
+
+    # Persist so subsequent cold-starts are instant (if storage is writable)
+    try:
+        with open(VECTOR_STORE_PATH, "wb") as fh:
+            pickle.dump({"chunks": raw_chunks, "embeddings": embeddings}, fh)
+        print(f"[RAG] Saved vector store to {VECTOR_STORE_PATH}")
+    except Exception as e:
+        print(f"[WARN] Could not save vector store: {e}")
+
+
+def _load_or_build_vector_store():
+    global _kb_chunks, _kb_embeddings
+
+    if os.path.exists(VECTOR_STORE_PATH):
+        print(f"[RAG] Loading pre-built vector store from {VECTOR_STORE_PATH}")
+        try:
+            with open(VECTOR_STORE_PATH, "rb") as fh:
+                data = pickle.load(fh)
+            _kb_chunks = data["chunks"]
+            _kb_embeddings = np.array(data["embeddings"], dtype=np.float32)
+            print(f"[RAG] Loaded {len(_kb_chunks)} chunks.")
+            return
+        except Exception as e:
+            print(f"[WARN] Could not load vector store: {e}. Rebuilding …")
+
+    _build_vector_store()
+
+
+# Build/load on startup
+_load_or_build_vector_store()
+
+
+def get_relevant_context(user_query: str, top_k: int = 3):
+    """Cosine-similarity search over the in-memory vector store."""
+    global _kb_chunks, _kb_embeddings
+
+    if _kb_embeddings is None or len(_kb_chunks) == 0:
+        return "", []
+
+    q_vec = embed_text([user_query])[0]
+    norm_q = np.linalg.norm(q_vec) + 1e-9
+    norm_kb = np.linalg.norm(_kb_embeddings, axis=1) + 1e-9
+    sims = _kb_embeddings @ q_vec / (norm_kb * norm_q)
+
+    top_idx = np.argsort(sims)[::-1][:top_k]
+    matched_chunks, sources = [], []
+
+    for i in top_idx:
+        if sims[i] < 0.15:
+            continue
+        chunk = _kb_chunks[i]
+        text = chunk["text"] if isinstance(chunk, dict) else chunk
+        matched_chunks.append(text)
+        if isinstance(chunk, dict):
+            sources.append({
+                "filename": chunk.get("filename", "Ayurvedic Document"),
+                "page": chunk.get("page", "N/A"),
+            })
+
+    return "\n\n".join(matched_chunks), sources
+
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
 SUPPORTED_LANGUAGES = {
-    "English",
-    "Assamese",
-    "Bengali",
-    "Bodo",
-    "Dogri",
-    "Gujarati",
-    "Hindi",
-    "Kannada",
-    "Kashmiri",
-    "Konkani",
-    "Maithili",
-    "Malayalam",
-    "Manipuri",
-    "Marathi",
-    "Nepali",
-    "Odia",
-    "Punjabi",
-    "Sanskrit",
-    "Santali",
-    "Sindhi",
-    "Tamil",
-    "Telugu",
-    "Urdu",
+    "English", "Assamese", "Bengali", "Bodo", "Dogri", "Gujarati", "Hindi",
+    "Kannada", "Kashmiri", "Konkani", "Maithili", "Malayalam", "Manipuri",
+    "Marathi", "Nepali", "Odia", "Punjabi", "Sanskrit", "Santali", "Sindhi",
+    "Tamil", "Telugu", "Urdu",
 }
 TRANSLATION_LANGUAGE_GUIDANCE = {
     "Assamese": "Assamese (অসমীয়া, Assamese script)",
@@ -125,80 +226,50 @@ TRANSLATION_LANGUAGE_GUIDANCE = {
     "Urdu": "Urdu (اردو, Urdu script)",
 }
 SUPPORTED_TOPICS = {
-    "General",
-    "Patents",
-    "Trademarks",
-    "Geographical Indications",
-    "Copyright",
-    "Designs",
-    "Ayurveda Regulations",
-    "Traditional Knowledge",
+    "General", "Patents", "Trademarks", "Geographical Indications",
+    "Copyright", "Designs", "Ayurveda Regulations", "Traditional Knowledge",
 }
 MAX_QUESTION_LENGTH = 2000
-MAX_SOURCES = 8
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 OPENAI_VECTOR_STORE_ID = os.getenv("OPENAI_VECTOR_STORE_ID")
-openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY")) if os.getenv("OPENAI_API_KEY") else None
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.6-flash")
-GEMINI_FALLBACK_MODEL = "gemini-3.5-flash-lite"
-gemini_client = genai.Client(api_key=os.getenv("GEMINI_API_KEY")) if os.getenv("GEMINI_API_KEY") else None
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 
-KNOWLEDGE_BASE_DIR = os.path.join(os.path.dirname(__file__), "knowledge_base")
 STOP_WORDS = {
     "a", "an", "and", "are", "about", "for", "how", "in", "is", "of", "on",
     "the", "to", "what", "which", "with", "can", "does", "do", "from", "under",
     "according", "based", "say", "says", "said", "pdf", "document", "documents",
-    "file", "files", "uploaded", "upload"
+    "file", "files", "uploaded", "upload",
 }
 KNOWLEDGE_BASE_CACHE = None
-IRRELEVANT_REQUEST_LOG = {}
-IRRELEVANT_REQUEST_LIMIT = 3
-IRRELEVANT_REQUEST_WINDOW_SECONDS = 60
-RELEVANCE_KEYWORDS = {
-    "ayurveda", "ayurvedic", "traditional", "patent", "patents",
-    "trademark", "trademarks", "geographical", "indication", "gi", "copyright",
-    "design", "designs", "formulation", "formulations", "regulation", "regulations",
-    "regulatory", "benefit", "sharing", "abs", "intellectual", "property", "ipr",
-    "invention", "inventor", "medicine", "medicinal", "medicines", "herb", "herbs",
-    "herbal", "plant", "plants", "biodiversity", "indigenous", "documentation",
-    "source", "legal", "law", "laws", "compliance", "ip", "ownership", "owner",
-    "rights", "registration", "register", "knowledge", "traditionalknowledge"
-}
-DOCUMENT_REFERENCE_KEYWORDS = {"pdf", "document", "documents", "file", "files", "uploaded"}
 
 
-def extract_question_terms(question):
-    terms = {
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def extract_question_terms(question: str) -> set:
+    return {
         term.lower() for term in re.findall(r"[A-Za-z]+(?:-[A-Za-z]+)?", question)
         if term.lower() not in STOP_WORDS and len(term) > 1
     }
-    return terms
 
 
-def is_question_relevant(question, topic):
+def is_question_relevant(question, topic) -> bool:
     if not isinstance(question, str):
         return False
-
-    normalized_question = " ".join(re.sub(r"[^a-z0-9\s]", " ", question.lower()).split())
-    if not normalized_question:
-        return False
-
-    return True
+    normalized = " ".join(re.sub(r"[^a-z0-9\s]", " ", question.lower()).split())
+    return bool(normalized)
 
 
-def get_client_ip():
+def get_client_ip() -> str:
     forwarded = request.headers.get("X-Forwarded-For", "")
     if forwarded:
         return forwarded.split(",")[0].strip()
     return request.remote_addr or "unknown-client"
 
 
-def check_irrelevant_request_limit(question):
-    return False
-
-
 @lru_cache(maxsize=1)
-def load_knowledge_base():
+def load_knowledge_base() -> list:
     global KNOWLEDGE_BASE_CACHE
     if KNOWLEDGE_BASE_CACHE is not None:
         return KNOWLEDGE_BASE_CACHE
@@ -208,26 +279,23 @@ def load_knowledge_base():
         for filename in sorted(files):
             if not filename.lower().endswith(".pdf"):
                 continue
-
             path = os.path.join(root, filename)
             try:
                 reader = PdfReader(path)
             except Exception as error:
                 print(f"SKIPPING unreadable PDF: {path} ({error})")
                 continue
-
             for page_number, page in enumerate(reader.pages, start=1):
                 try:
                     text = (page.extract_text() or "").strip()
                 except Exception as error:
-                    print(f"SKIPPING unreadable page {page_number} in {filename}: {error}")
+                    print(f"SKIPPING page {page_number} in {filename}: {error}")
                     continue
-
                 if text:
                     pages.append({
                         "filename": filename,
                         "page": page_number,
-                        "text": re.sub(r"\s+", " ", text)
+                        "text": re.sub(r"\s+", " ", text),
                     })
 
     KNOWLEDGE_BASE_CACHE = pages
@@ -240,38 +308,34 @@ def ensure_knowledge_base_loaded():
     return KNOWLEDGE_BASE_CACHE
 
 
-def find_source_page(filename, text):
+def find_source_page(filename: str, text: str):
     normalized_text = " ".join(text.lower().split())
     matching_pages = [
-        page for page in ensure_knowledge_base_loaded()
-        if page["filename"] == filename
+        p for p in ensure_knowledge_base_loaded() if p["filename"] == filename
     ]
-
-    for page in matching_pages:
-        if normalized_text and normalized_text in page["text"].lower():
-            return page["page"]
+    for p in matching_pages:
+        if normalized_text and normalized_text in p["text"].lower():
+            return p["page"]
 
     search_terms = {
-        term for term in re.findall(r"[a-z0-9]+", normalized_text)
-        if len(term) > 3 and term not in STOP_WORDS
+        t for t in re.findall(r"[a-z0-9]+", normalized_text)
+        if len(t) > 3 and t not in STOP_WORDS
     }
     if not search_terms:
         return None
 
-    best_page = None
-    best_score = 0
-    for page in matching_pages:
-        page_terms = set(re.findall(r"[a-z0-9]+", page["text"].lower()))
+    best_page, best_score = None, 0
+    for p in matching_pages:
+        page_terms = set(re.findall(r"[a-z0-9]+", p["text"].lower()))
         score = len(search_terms & page_terms)
         if score > best_score:
-            best_page = page
-            best_score = score
-
+            best_page, best_score = p, score
     return best_page["page"] if best_page and best_score >= 3 else None
 
 
-def retrieve_pages(question, topic):
-    if openai_client is not None and OPENAI_VECTOR_STORE_ID:
+def retrieve_pages(question: str, topic: str) -> list:
+    """Use OpenAI Vector Store if configured, else fall back to local search."""
+    if openai_client and OPENAI_VECTOR_STORE_ID:
         try:
             query = question if topic == "General" else f"{topic}: {question}"
             results = openai_client.vector_stores.search(
@@ -280,54 +344,58 @@ def retrieve_pages(question, topic):
                 max_num_results=3,
                 rewrite_query=True,
             )
-
             vector_pages = []
             for result in results.data:
                 text = "".join(
-                    content.text for content in result.content if content.type == "text"
+                    c.text for c in result.content if c.type == "text"
                 ).strip()
                 if text:
-                    # 1. Clean and resolve the real PDF filename
                     raw_fn = getattr(result, "filename", "") or ""
-                    if not raw_fn or raw_fn == "Knowledge Base Document" or len(raw_fn) > 30:
-                        clean_filename = "patent act.pdf"
-                    else:
-                        clean_filename = os.path.basename(raw_fn)
-
-                    # 2. Extract page number
+                    clean_filename = os.path.basename(raw_fn) if raw_fn else "Ayurvedic Document"
                     page_no = find_source_page(getattr(result, "filename", ""), text) or 1
-
                     vector_pages.append({
                         "filename": clean_filename,
                         "page": page_no,
                         "text": text,
                     })
-
             if vector_pages:
                 return vector_pages
-
         except Exception as error:
             print("VECTOR STORE ERROR:", error)
 
+    # Local fallback using Gemini embeddings
+    context_text, sources = get_relevant_context(question)
+    if context_text:
+        pages = []
+        for src in sources:
+            pages.append({
+                "filename": src.get("filename", "Ayurvedic Document"),
+                "page": src.get("page", "N/A"),
+                "text": context_text,
+            })
+        return pages
+
+    # Last resort: keyword-based search
     terms = extract_question_terms(question)
     if topic != "General":
-        terms.update(term.lower() for term in topic.split() if len(term) > 2)
+        terms.update(t.lower() for t in topic.split() if len(t) > 2)
 
     scored_pages = []
     for page in ensure_knowledge_base_loaded():
         haystack = page["text"].lower()
-        score = sum(haystack.count(term) for term in terms)
+        score = sum(haystack.count(t) for t in terms)
         if topic.lower() in page["filename"].lower():
             score += 3
         if score:
             scored_pages.append((score, page))
 
-    scored_pages.sort(key=lambda item: item[0], reverse=True)
-    pages = [page for _, page in scored_pages[:3]]
-    if not pages:
-        return []
-    return pages
+    scored_pages.sort(key=lambda x: x[0], reverse=True)
+    return [p for _, p in scored_pages[:3]]
 
+
+# ---------------------------------------------------------------------------
+# Translation
+# ---------------------------------------------------------------------------
 
 class TranslationUnavailableError(RuntimeError):
     def __init__(self, message, code="translation_unavailable"):
@@ -335,250 +403,147 @@ class TranslationUnavailableError(RuntimeError):
         self.code = code
 
 
-def translate_with_openai(answer, language):
-    if openai_client is None:
-        return None
-
-    response = openai_client.chat.completions.create(
-        model=OPENAI_MODEL,
-        messages=[
-            {
-                "role": "system",
-                "content": (
-                    f"Translate the answer completely into {TRANSLATION_LANGUAGE_GUIDANCE[language]}. "
-                    "Use the requested native script for every explanatory sentence. "
-                    "Do not return English prose. "
-                    "Preserve filenames, page numbers, bullet structure, "
-                    "and the educational disclaimer. Return only the translation."
-                ),
-            },
-            {"role": "user", "content": answer},
-        ],
-        temperature=0,
-    )
-    translated = response.choices[0].message.content
-    if not translated or not translated.strip():
-        return None
-    return translated.strip()
-
-
-def translate_answer(answer, language):
-    # GUARDRAIL 1: Stop if input text is empty
+def translate_answer(answer: str, language: str) -> str:
     if not answer or not str(answer).strip():
         return answer
-
-    # GUARDRAIL 2: Limit maximum text length to prevent timeouts
     if len(answer) > 3000:
         answer = answer[:3000]
-
-    # Clean the language input
     clean_lang = str(language).strip().lower()
-
-    # GUARDRAIL 3: Skip translation if language is English
-    if clean_lang in ["english", "en"]:
+    if clean_lang in ("english", "en"):
         return answer
 
-    # GUARDRAIL 4: Map language to code safely
-    target_code = "hi"  # Default fallback language
-
-    # Check if target language is in your SUPPORTED_LANGUAGES list
-    for key, code in SUPPORTED_LANGUAGES.items():
-        if key.lower() == clean_lang:
-            target_code = code
-            break
-
-    # GUARDRAIL 5: Translation network call with automatic failure protection
+    LANG_CODES = {
+        "assamese": "as", "bengali": "bn", "bodo": "brx", "dogri": "doi",
+        "gujarati": "gu", "hindi": "hi", "kannada": "kn", "kashmiri": "ks",
+        "konkani": "gom", "maithili": "mai", "malayalam": "ml", "manipuri": "mni",
+        "marathi": "mr", "nepali": "ne", "odia": "or", "punjabi": "pa",
+        "sanskrit": "sa", "santali": "sat", "sindhi": "sd", "tamil": "ta",
+        "telugu": "te", "urdu": "ur",
+    }
+    target_code = LANG_CODES.get(clean_lang, "hi")
     try:
-        translated = GoogleTranslator(
-            source="auto", target=target_code
-        ).translate(answer)
+        translated = GoogleTranslator(source="auto", target=target_code).translate(answer)
         return translated if translated else answer
     except Exception as error:
-        print("GUARDRAIL CAUGHT ERROR:", error)
-        # Returns original text instead of crashing or showing error messages
+        print("TRANSLATION ERROR:", error)
         return answer
 
-@app.route("/")
-def home():
-    return render_template("index.html")
 
-import re
+# ---------------------------------------------------------------------------
+# Relevance guardrail
+# ---------------------------------------------------------------------------
 
-
-def is_relevant_context(question, excerpts):
-    """Balanced Guardrail: Uses prefix/stem matching so word variations (e.g. patenting -> patent) match correctly."""
+def is_relevant_context(question: str, excerpts: list) -> bool:
     ignore_words = {
-        "what",
-        "is",
-        "how",
-        "can",
-        "the",
-        "a",
-        "an",
-        "in",
-        "of",
-        "for",
-        "to",
-        "about",
-        "with",
-        "tell",
-        "me",
-        "give",
-        "where",
-        "who",
-        "why",
-        "does",
-        "do",
-        "which",
-        "when",
-        "should",
-        "would",
-        "could",
-        "please",
-        "help",
-        "are",
-        "there",
-        "any",
-        "define",
-        "explain",
-        "describe",
+        "what", "is", "how", "can", "the", "a", "an", "in", "of", "for",
+        "to", "about", "with", "tell", "me", "give", "where", "who", "why",
+        "does", "do", "which", "when", "should", "would", "could", "please",
+        "help", "are", "there", "any", "define", "explain", "describe",
     }
-
-    # Extract clean query terms
     raw_words = [
         w.strip("?,.!'\"()[]{}")
         for w in question.lower().split()
         if w.strip("?,.!'\"()[]{}") not in ignore_words and len(w) > 2
     ]
-
     words = list(set(raw_words))
-
-    # If no specific keywords exist, let it pass to LLM grounding
     if not words:
         return True
 
-    combined_text = " ".join(excerpts).lower()
-
-    # Smart Matching: Checks for full word OR root stem (first 4+ chars) in context
-    matched_words = []
+    combined = " ".join(excerpts).lower()
+    matched = []
     for w in words:
-        # Full word match or stem match for longer words
         stem = w[:4] if len(w) >= 5 else w
-        if re.search(r"\b" + re.escape(stem), combined_text):
-            matched_words.append(w)
+        if re.search(r"\b" + re.escape(stem), combined):
+            matched.append(w)
 
-    match_ratio = len(matched_words) / len(words)
+    ratio = len(matched) / len(words)
+    print(f"[GUARDRAIL] keywords={words} matched={matched} ratio={ratio:.2f}")
+    return ratio >= 0.25 or len(matched) >= 1
 
-    print("\n================== GUARDRAIL CHECK ==================")
-    print("User Question      :", question)
-    print("Extracted Keywords :", words)
-    print("Matched Keywords   :", matched_words)
-    print(
-        f"Match Ratio        : {match_ratio:.2f} (Allowed if >= 0.25 or matches > 0)"
-    )
-    print("=====================================================\n")
 
-    # Pass if at least 25% of keywords match OR if at least 1 key term matches for short queries
-    return match_ratio >= 0.25 or len(matched_words) >= 1
+# ---------------------------------------------------------------------------
+# Routes
+# ---------------------------------------------------------------------------
+
+@app.route("/")
+def home():
+    return render_template("index.html")
 
 
 @app.route("/ask", methods=["POST"])
 def ask():
     data = request.get_json(silent=True)
     if not isinstance(data, dict):
-        return jsonify({
-            "answer": "Please send a valid question request.",
-            "error": "invalid_request"
-        }), 400
+        return jsonify({"answer": "Please send a valid JSON request.", "error": "invalid_request"}), 400
 
     raw_question = data.get("question", "")
     question = raw_question.strip() if isinstance(raw_question, str) else ""
+    language = data.get("language", "English")
 
     if not question:
         return jsonify({"answer": "Please enter a valid question.", "sources": []})
 
-    # 1. Retrieve pages from your vector search / knowledge base
-    pages = retrieve_pages(question, topic="General")
-
-    # 2. Extract exact filename and page numbers into sources list
-    sources = []
-    for page in pages:
-        source_str = f"{page['filename']} (Page {page['page']})"
-        if source_str not in sources:
-            sources.append(source_str)
-
-    # 3. Build context and call Gemini model
-    context = "\n\n".join([page["text"] for page in pages])
-    prompt = f"Context:\n{context}\n\nQuestion: {question}"
-    
-    # Call your generation function (or model.generate_content)
-    response = generate_response(prompt)
-    answer = response.text if hasattr(response, 'text') else str(response)
-
-    # 4. Return BOTH answer and sources in the JSON response
-    return jsonify({
-        "answer": answer,
-        "sources": sources
-    })
-
-    fallback_refusal = "The local knowledge base does not contain enough relevant information to answer this question."
+    if len(question) > MAX_QUESTION_LENGTH:
+        return jsonify({"answer": "Question is too long. Please keep it under 2000 characters."}), 400
 
     try:
-        # Guardrail 1: Input Length Check
-        if len(question) > 1000:
-            return jsonify({"answer": "Question is too long. Please restrict your query to under 1000 characters."}), 400
+        # 1. Retrieve relevant pages
+        pages = retrieve_pages(question, topic="General")
 
-        # 1. Search local vectors
-        context, sources = get_relevant_context(question)
+        # 2. Build source list
+        sources = []
+        for page in pages:
+            src_str = f"{page['filename']} (Page {page['page']})"
+            if src_str not in sources:
+                sources.append(src_str)
 
-        # Guardrail 2: Refuse ungrounded queries if no context matches
-        if not context or context.strip() == "":
-            fallback_msg = "The local knowledge base does not contain enough relevant information to answer this question."
-            return jsonify({
-                "answer": fallback_msg,
-                "sources": [],
-                "citation_status": "no_citation"
-            })
+        # 3. Build prompt
+        context = "\n\n".join(page["text"] for page in pages)
 
-        # Guardrail 3: Strict System Instruction against Hallucinations
         system_instruction = (
-            "You are TATVA, an AI Knowledge Assistant. "
-            "CRITICAL GUARDRAILS:\n"
-            "- Answer the user's question STRICTLY using only the provided Knowledge Base Context.\n"
-            "- Do NOT use outside knowledge, general assumptions, or extrapolate beyond what is stated in the context.\n"
-            "- If the provided context does not contain the exact answer, state clearly: "
-            "'The local knowledge base does not contain enough relevant information to answer this question.'\n"
-            "- Do NOT invent, assume, or improvise medical formulations or patent guidelines."
+            "You are TATVA, an AI Knowledge Assistant specialising in Ayurveda, "
+            "Traditional Knowledge, and Intellectual Property Rights (IPR). "
+            "Answer STRICTLY using the provided Knowledge Base Context. "
+            "Do NOT use outside knowledge or extrapolate beyond what is stated. "
+            "If the context is insufficient, say so clearly."
         )
-
-        user_prompt = f"Knowledge Base Context:\n{context}\n\nUser Question: {question}"
+        user_prompt = (
+            f"Knowledge Base Context:\n{context}\n\n"
+            f"User Question: {question}"
+        )
         if language and language.lower() != "english":
             user_prompt += f"\n\nPlease provide your answer in {language}."
 
-        # 2. Call Gemini with System Instructions & Low Temperature
+        # 4. Generate answer
         response = client.models.generate_content(
-            model=os.getenv("GEMINI_MODEL", "gemini-3.8-flash"),
+            model=GEMINI_MODEL,
             contents=user_prompt,
             config={
                 "system_instruction": system_instruction,
-                "temperature": 0.1  # Deterministic / low creativity for factual precision
-            }
+                "temperature": 0.1,
+            },
         )
+        answer = response.text if hasattr(response, "text") else str(response)
+
+        # 5. Translate if needed
+        if language and language.lower() not in ("english", "en"):
+            answer = translate_answer(answer, language)
 
         return jsonify({
-            "answer": response.text,
+            "answer": answer,
             "sources": sources,
-            "citation_status": "complete" if sources else "no_citation"
+            "citation_status": "complete" if sources else "no_citation",
         })
 
     except Exception as e:
-        print("ERROR IN ASK ROUTE:", e)
-        return jsonify({"answer": f"An error occurred while processing your request: {str(e)}"}), 500
+        print("ERROR IN /ask:", e)
+        return jsonify({"answer": f"An error occurred: {str(e)}"}), 500
 
 
-import os
-
-port = int(os.environ.get("PORT",10000 ))
+# ---------------------------------------------------------------------------
+# Run
+# ---------------------------------------------------------------------------
+port = int(os.environ.get("PORT", 10000))
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=port)
+    app.run(host="0.0.0.0", port=port, debug=False)

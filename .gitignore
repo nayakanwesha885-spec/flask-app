@@ -7,3 +7,16 @@ venv/
 .venv/
 *.log
 .DS_Store
+
+# Large model and data files — do NOT commit these to git
+model_cache/
+vector_store.pkl
+
+# Large PDFs that exceed Render's 500MB repo limit
+# Upload these to OpenAI Vector Store instead (see README)
+knowledge_base/ayurveda_data/Charaka Samhitha - Vol. I - P.V.Sharma.pdf
+knowledge_base/ayurveda_data/Materia Medica of Ayurveda.pdf
+
+# Python virtual environment
+*.pyd
+*.so

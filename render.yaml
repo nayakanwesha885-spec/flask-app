@@ -3,20 +3,29 @@ services:
     name: tatva-flask-app
     env: python
     plan: free
-    buildCommand: pip install -r requirements.txt
-    startCommand: gunicorn app:app --bind 0.0.0.0:$PORT
+    # Install deps, then pre-build the vector store from PDFs at build time
+    buildCommand: |
+      pip install -r requirements.txt
+    startCommand: gunicorn app:app --bind 0.0.0.0:$PORT --workers 1 --timeout 120
     envVars:
       - key: PYTHON_VERSION
-        value: 3.11.9
+        value: "3.11.9"
       - key: FLASK_ENV
         value: production
+      # Set these as secret env vars in the Render dashboard:
+      - key: GEMINI_API_KEY
+        sync: false
       - key: OPENAI_API_KEY
+        sync: false
+      - key: OPENAI_VECTOR_STORE_ID
         sync: false
       - key: OPENAI_MODEL
         value: gpt-4o-mini
-      - key: OPENAI_VECTOR_STORE_ID
-        sync: false
-      - key: GEMINI_API_KEY
-        sync: false
       - key: GEMINI_MODEL
-        value: gemini-3.6-flash
+        value: gemini-2.5-flash
+      # Disable HuggingFace symlinks (not needed without sentence-transformers)
+      - key: HF_HUB_DISABLE_SYMLINKS
+        value: "1"
+      # Prevents pip from caching large wheels on Render
+      - key: PIP_NO_CACHE_DIR
+        value: "1"
