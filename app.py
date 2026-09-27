@@ -3,8 +3,8 @@ from dotenv import load_dotenv
 from pypdf import PdfReader
 import os
 import re
-import time
 import pickle
+import threading
 from functools import lru_cache
 from openai import OpenAI
 from google import genai
@@ -23,15 +23,18 @@ client = genai.Client(api_key=GEMINI_API_KEY)
 openai_client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 
 # ---------------------------------------------------------------------------
-# Model pipeline — tries models in order until one succeeds
+# Model pipeline
 # ---------------------------------------------------------------------------
 MODEL_PIPELINE = [
     "gemini-2.5-flash",
     "gemini-2.0-flash",
     "gemini-1.5-flash",
 ]
+EMBEDDING_MODEL = "text-embedding-004"   # Gemini embedding model (no local download)
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+OPENAI_VECTOR_STORE_ID = os.getenv("OPENAI_VECTOR_STORE_ID")
 
-EMBEDDING_MODEL = "text-embedding-004"   # Gemini free-tier embedding model
 
 def generate_response(prompt: str):
     for model_id in MODEL_PIPELINE:
@@ -42,12 +45,8 @@ def generate_response(prompt: str):
     raise RuntimeError("All Gemini model endpoints failed.")
 
 
-def embed_text(texts: list[str]) -> np.ndarray:
-    """
-    Embed a list of strings using the Gemini Embedding API.
-    Returns a (len(texts), dim) float32 ndarray.
-    Falls back to zero-vectors on error so startup never crashes.
-    """
+def embed_text(texts: list) -> np.ndarray:
+    """Embed strings via Gemini API. Falls back to zero-vectors on error."""
     vectors = []
     for text in texts:
         try:
@@ -57,33 +56,35 @@ def embed_text(texts: list[str]) -> np.ndarray:
             )
             vectors.append(result.embeddings[0].values)
         except Exception as e:
-            print(f"[WARN] embed_text failed for chunk: {e}")
+            print(f"[WARN] embed_text failed: {e}")
             vectors.append([0.0] * 768)   # text-embedding-004 dim = 768
     return np.array(vectors, dtype=np.float32)
 
 
 # ---------------------------------------------------------------------------
-# Flask app
+# Flask app — created BEFORE any startup work so gunicorn can import it
 # ---------------------------------------------------------------------------
 app = Flask(__name__)
-app.config["MAX_CONTENT_LENGTH"] = 16 * 1024 * 1024   # 16 MB upload cap
+app.config["MAX_CONTENT_LENGTH"] = 16 * 1024 * 1024
 
 # ---------------------------------------------------------------------------
-# Vector store — built lazily from PDFs in knowledge_base/
-# If a pre-built vector_store.pkl exists it is loaded directly (for local dev).
-# On Render the pkl is NOT committed, so it is built from the PDFs at startup.
+# Vector store state
 # ---------------------------------------------------------------------------
 VECTOR_STORE_PATH = os.path.join(os.path.dirname(__file__), "vector_store.pkl")
 KNOWLEDGE_BASE_DIR = os.path.join(os.path.dirname(__file__), "knowledge_base")
 
 _kb_chunks: list = []
-_kb_embeddings: np.ndarray | None = None
+_kb_embeddings: np.ndarray = np.empty((0, 768), dtype=np.float32)
+_kb_ready = False          # True once the vector store is loaded/built
+_kb_lock = threading.Lock()
 
 
-def _chunk_text(text: str, chunk_size: int = 500, overlap: int = 50) -> list[str]:
-    """Split text into overlapping character-level chunks."""
-    chunks = []
-    start = 0
+# ---------------------------------------------------------------------------
+# Helpers: chunking and building
+# ---------------------------------------------------------------------------
+
+def _chunk_text(text: str, chunk_size: int = 500, overlap: int = 50) -> list:
+    chunks, start = [], 0
     while start < len(text):
         end = start + chunk_size
         chunks.append(text[start:end].strip())
@@ -92,8 +93,8 @@ def _chunk_text(text: str, chunk_size: int = 500, overlap: int = 50) -> list[str
 
 
 def _build_vector_store():
-    """Read all PDFs in knowledge_base/, chunk them, embed with Gemini."""
-    global _kb_chunks, _kb_embeddings
+    """Read PDFs, chunk them, embed via Gemini. Called in a background thread."""
+    global _kb_chunks, _kb_embeddings, _kb_ready
 
     raw_chunks = []
     for root, _, files in os.walk(KNOWLEDGE_BASE_DIR):
@@ -101,7 +102,7 @@ def _build_vector_store():
             if not filename.lower().endswith(".pdf"):
                 continue
             path = os.path.join(root, filename)
-            print(f"[RAG] Processing PDF: {path}")
+            print(f"[RAG] Processing: {path}")
             try:
                 reader = PdfReader(path)
                 for page_num, page in enumerate(reader.pages, start=1):
@@ -119,60 +120,74 @@ def _build_vector_store():
                 print(f"[WARN] Skipping {path}: {e}")
 
     if not raw_chunks:
-        print("[RAG] No PDF chunks found — vector store is empty.")
-        _kb_chunks = []
-        _kb_embeddings = np.empty((0, 768), dtype=np.float32)
+        print("[RAG] No PDF chunks found.")
+        with _kb_lock:
+            _kb_ready = True
         return
 
-    print(f"[RAG] Embedding {len(raw_chunks)} chunks via Gemini API …")
+    print(f"[RAG] Embedding {len(raw_chunks)} chunks …")
     texts = [c["text"] for c in raw_chunks]
     embeddings = embed_text(texts)
 
-    _kb_chunks = raw_chunks
-    _kb_embeddings = embeddings
+    with _kb_lock:
+        _kb_chunks = raw_chunks
+        _kb_embeddings = embeddings
+        _kb_ready = True
 
-    # Persist so subsequent cold-starts are instant (if storage is writable)
+    # Try to persist (may fail on read-only filesystems — that's OK)
     try:
         with open(VECTOR_STORE_PATH, "wb") as fh:
             pickle.dump({"chunks": raw_chunks, "embeddings": embeddings}, fh)
-        print(f"[RAG] Saved vector store to {VECTOR_STORE_PATH}")
+        print(f"[RAG] Saved vector store ({len(raw_chunks)} chunks)")
     except Exception as e:
         print(f"[WARN] Could not save vector store: {e}")
 
 
 def _load_or_build_vector_store():
-    global _kb_chunks, _kb_embeddings
+    """Try to load a pre-built pkl, otherwise build in background thread."""
+    global _kb_chunks, _kb_embeddings, _kb_ready
 
     if os.path.exists(VECTOR_STORE_PATH):
-        print(f"[RAG] Loading pre-built vector store from {VECTOR_STORE_PATH}")
+        print(f"[RAG] Loading pre-built vector store …")
         try:
             with open(VECTOR_STORE_PATH, "rb") as fh:
                 data = pickle.load(fh)
-            _kb_chunks = data["chunks"]
-            _kb_embeddings = np.array(data["embeddings"], dtype=np.float32)
-            print(f"[RAG] Loaded {len(_kb_chunks)} chunks.")
+            with _kb_lock:
+                _kb_chunks = data["chunks"]
+                _kb_embeddings = np.array(data["embeddings"], dtype=np.float32)
+                _kb_ready = True
+            print(f"[RAG] Loaded {len(_kb_chunks)} chunks from disk.")
             return
         except Exception as e:
             print(f"[WARN] Could not load vector store: {e}. Rebuilding …")
 
-    _build_vector_store()
+    # Build in background so gunicorn binds the port immediately
+    print("[RAG] Starting background vector store build …")
+    t = threading.Thread(target=_build_vector_store, daemon=True)
+    t.start()
 
 
-# Build/load on startup
+# Start loading/building immediately when the module is imported
 _load_or_build_vector_store()
 
 
-def get_relevant_context(user_query: str, top_k: int = 3):
-    """Cosine-similarity search over the in-memory vector store."""
-    global _kb_chunks, _kb_embeddings
+# ---------------------------------------------------------------------------
+# RAG: cosine similarity search
+# ---------------------------------------------------------------------------
 
-    if _kb_embeddings is None or len(_kb_chunks) == 0:
+def get_relevant_context(user_query: str, top_k: int = 3):
+    with _kb_lock:
+        ready = _kb_ready
+        chunks = _kb_chunks
+        embeddings = _kb_embeddings
+
+    if not ready or len(chunks) == 0:
         return "", []
 
     q_vec = embed_text([user_query])[0]
     norm_q = np.linalg.norm(q_vec) + 1e-9
-    norm_kb = np.linalg.norm(_kb_embeddings, axis=1) + 1e-9
-    sims = _kb_embeddings @ q_vec / (norm_kb * norm_q)
+    norm_kb = np.linalg.norm(embeddings, axis=1) + 1e-9
+    sims = embeddings @ q_vec / (norm_kb * norm_q)
 
     top_idx = np.argsort(sims)[::-1][:top_k]
     matched_chunks, sources = [], []
@@ -180,7 +195,7 @@ def get_relevant_context(user_query: str, top_k: int = 3):
     for i in top_idx:
         if sims[i] < 0.15:
             continue
-        chunk = _kb_chunks[i]
+        chunk = chunks[i]
         text = chunk["text"] if isinstance(chunk, dict) else chunk
         matched_chunks.append(text)
         if isinstance(chunk, dict):
@@ -225,48 +240,19 @@ TRANSLATION_LANGUAGE_GUIDANCE = {
     "Telugu": "Telugu (తెలుగు, Telugu script)",
     "Urdu": "Urdu (اردو, Urdu script)",
 }
-SUPPORTED_TOPICS = {
-    "General", "Patents", "Trademarks", "Geographical Indications",
-    "Copyright", "Designs", "Ayurveda Regulations", "Traditional Knowledge",
-}
-MAX_QUESTION_LENGTH = 2000
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
-OPENAI_VECTOR_STORE_ID = os.getenv("OPENAI_VECTOR_STORE_ID")
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
-
 STOP_WORDS = {
     "a", "an", "and", "are", "about", "for", "how", "in", "is", "of", "on",
     "the", "to", "what", "which", "with", "can", "does", "do", "from", "under",
     "according", "based", "say", "says", "said", "pdf", "document", "documents",
     "file", "files", "uploaded", "upload",
 }
+MAX_QUESTION_LENGTH = 2000
 KNOWLEDGE_BASE_CACHE = None
 
 
 # ---------------------------------------------------------------------------
-# Helpers
+# Knowledge base page lookup (for source citations)
 # ---------------------------------------------------------------------------
-
-def extract_question_terms(question: str) -> set:
-    return {
-        term.lower() for term in re.findall(r"[A-Za-z]+(?:-[A-Za-z]+)?", question)
-        if term.lower() not in STOP_WORDS and len(term) > 1
-    }
-
-
-def is_question_relevant(question, topic) -> bool:
-    if not isinstance(question, str):
-        return False
-    normalized = " ".join(re.sub(r"[^a-z0-9\s]", " ", question.lower()).split())
-    return bool(normalized)
-
-
-def get_client_ip() -> str:
-    forwarded = request.headers.get("X-Forwarded-For", "")
-    if forwarded:
-        return forwarded.split(",")[0].strip()
-    return request.remote_addr or "unknown-client"
-
 
 @lru_cache(maxsize=1)
 def load_knowledge_base() -> list:
@@ -288,8 +274,7 @@ def load_knowledge_base() -> list:
             for page_number, page in enumerate(reader.pages, start=1):
                 try:
                     text = (page.extract_text() or "").strip()
-                except Exception as error:
-                    print(f"SKIPPING page {page_number} in {filename}: {error}")
+                except Exception:
                     continue
                 if text:
                     pages.append({
@@ -309,23 +294,21 @@ def ensure_knowledge_base_loaded():
 
 
 def find_source_page(filename: str, text: str):
-    normalized_text = " ".join(text.lower().split())
-    matching_pages = [
-        p for p in ensure_knowledge_base_loaded() if p["filename"] == filename
-    ]
-    for p in matching_pages:
-        if normalized_text and normalized_text in p["text"].lower():
+    normalized = " ".join(text.lower().split())
+    matching = [p for p in ensure_knowledge_base_loaded() if p["filename"] == filename]
+    for p in matching:
+        if normalized and normalized in p["text"].lower():
             return p["page"]
 
     search_terms = {
-        t for t in re.findall(r"[a-z0-9]+", normalized_text)
+        t for t in re.findall(r"[a-z0-9]+", normalized)
         if len(t) > 3 and t not in STOP_WORDS
     }
     if not search_terms:
         return None
 
     best_page, best_score = None, 0
-    for p in matching_pages:
+    for p in matching:
         page_terms = set(re.findall(r"[a-z0-9]+", p["text"].lower()))
         score = len(search_terms & page_terms)
         if score > best_score:
@@ -333,8 +316,16 @@ def find_source_page(filename: str, text: str):
     return best_page["page"] if best_page and best_score >= 3 else None
 
 
-def retrieve_pages(question: str, topic: str) -> list:
-    """Use OpenAI Vector Store if configured, else fall back to local search."""
+def extract_question_terms(question: str) -> set:
+    return {
+        term.lower() for term in re.findall(r"[A-Za-z]+(?:-[A-Za-z]+)?", question)
+        if term.lower() not in STOP_WORDS and len(term) > 1
+    }
+
+
+def retrieve_pages(question: str, topic: str = "General") -> list:
+    """OpenAI Vector Store → Gemini embedding search → keyword fallback."""
+    # 1. OpenAI Vector Store (if configured)
     if openai_client and OPENAI_VECTOR_STORE_ID:
         try:
             query = question if topic == "General" else f"{topic}: {question}"
@@ -351,10 +342,10 @@ def retrieve_pages(question: str, topic: str) -> list:
                 ).strip()
                 if text:
                     raw_fn = getattr(result, "filename", "") or ""
-                    clean_filename = os.path.basename(raw_fn) if raw_fn else "Ayurvedic Document"
-                    page_no = find_source_page(getattr(result, "filename", ""), text) or 1
+                    clean_fn = os.path.basename(raw_fn) if raw_fn else "Ayurvedic Document"
+                    page_no = find_source_page(raw_fn, text) or 1
                     vector_pages.append({
-                        "filename": clean_filename,
+                        "filename": clean_fn,
                         "page": page_no,
                         "text": text,
                     })
@@ -363,7 +354,7 @@ def retrieve_pages(question: str, topic: str) -> list:
         except Exception as error:
             print("VECTOR STORE ERROR:", error)
 
-    # Local fallback using Gemini embeddings
+    # 2. Local Gemini-embedding search
     context_text, sources = get_relevant_context(question)
     if context_text:
         pages = []
@@ -375,32 +366,36 @@ def retrieve_pages(question: str, topic: str) -> list:
             })
         return pages
 
-    # Last resort: keyword-based search
+    # 3. Keyword fallback
     terms = extract_question_terms(question)
     if topic != "General":
         terms.update(t.lower() for t in topic.split() if len(t) > 2)
 
-    scored_pages = []
+    scored = []
     for page in ensure_knowledge_base_loaded():
         haystack = page["text"].lower()
         score = sum(haystack.count(t) for t in terms)
         if topic.lower() in page["filename"].lower():
             score += 3
         if score:
-            scored_pages.append((score, page))
+            scored.append((score, page))
 
-    scored_pages.sort(key=lambda x: x[0], reverse=True)
-    return [p for _, p in scored_pages[:3]]
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return [p for _, p in scored[:3]]
 
 
 # ---------------------------------------------------------------------------
 # Translation
 # ---------------------------------------------------------------------------
 
-class TranslationUnavailableError(RuntimeError):
-    def __init__(self, message, code="translation_unavailable"):
-        super().__init__(message)
-        self.code = code
+LANG_CODES = {
+    "assamese": "as", "bengali": "bn", "bodo": "brx", "dogri": "doi",
+    "gujarati": "gu", "hindi": "hi", "kannada": "kn", "kashmiri": "ks",
+    "konkani": "gom", "maithili": "mai", "malayalam": "ml", "manipuri": "mni",
+    "marathi": "mr", "nepali": "ne", "odia": "or", "punjabi": "pa",
+    "sanskrit": "sa", "santali": "sat", "sindhi": "sd", "tamil": "ta",
+    "telugu": "te", "urdu": "ur",
+}
 
 
 def translate_answer(answer: str, language: str) -> str:
@@ -411,15 +406,6 @@ def translate_answer(answer: str, language: str) -> str:
     clean_lang = str(language).strip().lower()
     if clean_lang in ("english", "en"):
         return answer
-
-    LANG_CODES = {
-        "assamese": "as", "bengali": "bn", "bodo": "brx", "dogri": "doi",
-        "gujarati": "gu", "hindi": "hi", "kannada": "kn", "kashmiri": "ks",
-        "konkani": "gom", "maithili": "mai", "malayalam": "ml", "manipuri": "mni",
-        "marathi": "mr", "nepali": "ne", "odia": "or", "punjabi": "pa",
-        "sanskrit": "sa", "santali": "sat", "sindhi": "sd", "tamil": "ta",
-        "telugu": "te", "urdu": "ur",
-    }
     target_code = LANG_CODES.get(clean_lang, "hi")
     try:
         translated = GoogleTranslator(source="auto", target=target_code).translate(answer)
@@ -434,7 +420,7 @@ def translate_answer(answer: str, language: str) -> str:
 # ---------------------------------------------------------------------------
 
 def is_relevant_context(question: str, excerpts: list) -> bool:
-    ignore_words = {
+    ignore = {
         "what", "is", "how", "can", "the", "a", "an", "in", "of", "for",
         "to", "about", "with", "tell", "me", "give", "where", "who", "why",
         "does", "do", "which", "when", "should", "would", "could", "please",
@@ -443,7 +429,7 @@ def is_relevant_context(question: str, excerpts: list) -> bool:
     raw_words = [
         w.strip("?,.!'\"()[]{}")
         for w in question.lower().split()
-        if w.strip("?,.!'\"()[]{}") not in ignore_words and len(w) > 2
+        if w.strip("?,.!'\"()[]{}") not in ignore and len(w) > 2
     ]
     words = list(set(raw_words))
     if not words:
@@ -457,7 +443,6 @@ def is_relevant_context(question: str, excerpts: list) -> bool:
             matched.append(w)
 
     ratio = len(matched) / len(words)
-    print(f"[GUARDRAIL] keywords={words} matched={matched} ratio={ratio:.2f}")
     return ratio >= 0.25 or len(matched) >= 1
 
 
@@ -468,6 +453,12 @@ def is_relevant_context(question: str, excerpts: list) -> bool:
 @app.route("/")
 def home():
     return render_template("index.html")
+
+
+@app.route("/health")
+def health():
+    """Health check — returns 200 immediately even while RAG is building."""
+    return jsonify({"status": "ok", "rag_ready": _kb_ready})
 
 
 @app.route("/ask", methods=["POST"])
@@ -486,18 +477,19 @@ def ask():
     if len(question) > MAX_QUESTION_LENGTH:
         return jsonify({"answer": "Question is too long. Please keep it under 2000 characters."}), 400
 
+    # If RAG is still being built, warn but still try to answer via Gemini
+    if not _kb_ready:
+        print("[INFO] RAG not ready yet — answering without context.")
+
     try:
-        # 1. Retrieve relevant pages
         pages = retrieve_pages(question, topic="General")
 
-        # 2. Build source list
         sources = []
         for page in pages:
             src_str = f"{page['filename']} (Page {page['page']})"
             if src_str not in sources:
                 sources.append(src_str)
 
-        # 3. Build prompt
         context = "\n\n".join(page["text"] for page in pages)
 
         system_instruction = (
@@ -511,10 +503,9 @@ def ask():
             f"Knowledge Base Context:\n{context}\n\n"
             f"User Question: {question}"
         )
-        if language and language.lower() != "english":
+        if language and language.lower() not in ("english", "en"):
             user_prompt += f"\n\nPlease provide your answer in {language}."
 
-        # 4. Generate answer
         response = client.models.generate_content(
             model=GEMINI_MODEL,
             contents=user_prompt,
@@ -525,7 +516,6 @@ def ask():
         )
         answer = response.text if hasattr(response, "text") else str(response)
 
-        # 5. Translate if needed
         if language and language.lower() not in ("english", "en"):
             answer = translate_answer(answer, language)
 
@@ -541,7 +531,7 @@ def ask():
 
 
 # ---------------------------------------------------------------------------
-# Run
+# Entry point
 # ---------------------------------------------------------------------------
 port = int(os.environ.get("PORT", 10000))
 
