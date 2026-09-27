@@ -19,7 +19,7 @@ services:
       - key: OPENAI_MODEL
         value: gpt-4o-mini
       - key: GEMINI_MODEL
-        value: gemini-2.5-flash
+        value: gemini-3.8-flash
       - key: HF_HUB_DISABLE_SYMLINKS
         value: "1"
       - key: PIP_NO_CACHE_DIR

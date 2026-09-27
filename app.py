@@ -12,6 +12,17 @@ from deep_translator import GoogleTranslator
 import numpy as np
 
 # ---------------------------------------------------------------------------
+# Network optimization: prefer IPv4 to prevent IPv6 DNS/connect timeouts
+# ---------------------------------------------------------------------------
+import socket
+_original_getaddrinfo = socket.getaddrinfo
+def _ipv4_first_getaddrinfo(*args, **kwargs):
+    res = _original_getaddrinfo(*args, **kwargs)
+    ipv4 = [r for r in res if r[0] == socket.AF_INET]
+    return ipv4 if ipv4 else res
+socket.getaddrinfo = _ipv4_first_getaddrinfo
+
+# ---------------------------------------------------------------------------
 # Environment
 # ---------------------------------------------------------------------------
 load_dotenv()
@@ -26,38 +37,50 @@ openai_client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 # Model pipeline
 # ---------------------------------------------------------------------------
 MODEL_PIPELINE = [
-    "gemini-2.5-flash",
-    "gemini-2.0-flash",
-    "gemini-1.5-flash",
+    "gemini-3.8-flash",
+    "gemini-3.6-flash",
+    "gemini-flash-latest",
 ]
-EMBEDDING_MODEL = "text-embedding-004"   # Gemini embedding model (no local download)
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+EMBEDDING_MODEL = "gemini-embedding-001"   # Gemini embedding model
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 OPENAI_VECTOR_STORE_ID = os.getenv("OPENAI_VECTOR_STORE_ID")
 
 
 def generate_response(prompt: str):
-    for model_id in MODEL_PIPELINE:
-        try:
-            return client.models.generate_content(model=model_id, contents=prompt)
-        except Exception as e:
-            print(f"[WARN] {model_id} failed: {e}")
-    raise RuntimeError("All Gemini model endpoints failed.")
+    import time
+    primary = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
+    models_to_try = [primary] + [m for m in MODEL_PIPELINE if m != primary]
+    last_err = None
+    for model_id in models_to_try:
+        for attempt in range(2):
+            try:
+                return client.models.generate_content(model=model_id, contents=prompt)
+            except Exception as e:
+                last_err = e
+                err_str = str(e)
+                print(f"[WARN] {model_id} (attempt {attempt+1}) failed: {e}")
+                if "503" in err_str or "high demand" in err_str.lower():
+                    time.sleep(1.5)
+                    continue
+                break
+    raise RuntimeError(f"All Gemini model endpoints failed: {last_err}")
 
 
 def embed_text(texts: list) -> np.ndarray:
-    """Embed strings via Gemini API. Falls back to zero-vectors on error."""
+    """Embed strings via Gemini API (768 dimensions). Falls back to zero-vectors on error."""
     vectors = []
     for text in texts:
         try:
             result = client.models.embed_content(
                 model=EMBEDDING_MODEL,
                 contents=text,
+                config={"output_dimensionality": 768}
             )
             vectors.append(result.embeddings[0].values)
         except Exception as e:
             print(f"[WARN] embed_text failed: {e}")
-            vectors.append([0.0] * 768)   # text-embedding-004 dim = 768
+            vectors.append([0.0] * 768)   # dim = 768
     return np.array(vectors, dtype=np.float32)
 
 
@@ -181,30 +204,45 @@ def get_relevant_context(user_query: str, top_k: int = 3):
         chunks = _kb_chunks
         embeddings = _kb_embeddings
 
-    if not ready or len(chunks) == 0:
+    if not ready or len(chunks) == 0 or embeddings.size == 0:
         return "", []
 
-    q_vec = embed_text([user_query])[0]
-    norm_q = np.linalg.norm(q_vec) + 1e-9
-    norm_kb = np.linalg.norm(embeddings, axis=1) + 1e-9
-    sims = embeddings @ q_vec / (norm_kb * norm_q)
+    try:
+        q_vec = embed_text([user_query])[0]
+        # Check for dimension mismatch (e.g. if pre-built vector store has different dim)
+        if embeddings.ndim != 2 or embeddings.shape[1] != len(q_vec):
+            print(f"[WARN] Vector dimension mismatch: kb has {embeddings.shape}, query has {len(q_vec)}. Using keyword search.")
+            return "", []
 
-    top_idx = np.argsort(sims)[::-1][:top_k]
-    matched_chunks, sources = [], []
+        norm_q = np.linalg.norm(q_vec) + 1e-9
+        norm_kb = np.linalg.norm(embeddings, axis=1) + 1e-9
+        sims = embeddings @ q_vec / (norm_kb * norm_q)
 
-    for i in top_idx:
-        if sims[i] < 0.15:
-            continue
-        chunk = chunks[i]
-        text = chunk["text"] if isinstance(chunk, dict) else chunk
-        matched_chunks.append(text)
-        if isinstance(chunk, dict):
-            sources.append({
-                "filename": chunk.get("filename", "Ayurvedic Document"),
-                "page": chunk.get("page", "N/A"),
-            })
+        top_idx = np.argsort(sims)[::-1][:top_k]
+        matched_chunks, sources = [], []
 
-    return "\n\n".join(matched_chunks), sources
+        for i in top_idx:
+            if sims[i] < 0.15:
+                continue
+            chunk = chunks[i]
+            if isinstance(chunk, dict):
+                text = chunk.get("text", "")
+                sources.append({
+                    "filename": chunk.get("filename", "Ayurvedic Document"),
+                    "page": chunk.get("page", "N/A"),
+                })
+            else:
+                text = str(chunk)
+                sources.append({
+                    "filename": "Ayurvedic Document",
+                    "page": "N/A",
+                })
+            matched_chunks.append(text)
+
+        return "\n\n".join(matched_chunks), sources
+    except Exception as e:
+        print(f"[WARN] Error in get_relevant_context: {e}")
+        return "", []
 
 
 # ---------------------------------------------------------------------------
@@ -366,22 +404,41 @@ def retrieve_pages(question: str, topic: str = "General") -> list:
             })
         return pages
 
-    # 3. Keyword fallback
+    # 3. Fast in-memory keyword search across pre-loaded chunks
     terms = extract_question_terms(question)
     if topic != "General":
         terms.update(t.lower() for t in topic.split() if len(t) > 2)
 
-    scored = []
-    for page in ensure_knowledge_base_loaded():
-        haystack = page["text"].lower()
-        score = sum(haystack.count(t) for t in terms)
-        if topic.lower() in page["filename"].lower():
-            score += 3
-        if score:
-            scored.append((score, page))
+    with _kb_lock:
+        chunks = list(_kb_chunks)
 
-    scored.sort(key=lambda x: x[0], reverse=True)
-    return [p for _, p in scored[:3]]
+    scored = []
+    for chunk in chunks:
+        if isinstance(chunk, dict):
+            text = chunk.get("text", "")
+            filename = chunk.get("filename", "Ayurvedic Document")
+            page_no = chunk.get("page", 1)
+        else:
+            text = str(chunk)
+            filename = "Ayurvedic Document"
+            page_no = 1
+
+        haystack = text.lower()
+        score = sum(haystack.count(t) for t in terms)
+        if topic.lower() in filename.lower():
+            score += 3
+        if score > 0:
+            scored.append((score, {
+                "filename": filename,
+                "page": page_no,
+                "text": text,
+            }))
+
+    if scored:
+        scored.sort(key=lambda x: x[0], reverse=True)
+        return [p for _, p in scored[:3]]
+
+    return []
 
 
 # ---------------------------------------------------------------------------
@@ -481,8 +538,10 @@ def ask():
     if not _kb_ready:
         print("[INFO] RAG not ready yet — answering without context.")
 
+    topic = data.get("topic", "General")
+
     try:
-        pages = retrieve_pages(question, topic="General")
+        pages = retrieve_pages(question, topic=topic)
 
         sources = []
         for page in pages:
@@ -493,27 +552,24 @@ def ask():
         context = "\n\n".join(page["text"] for page in pages)
 
         system_instruction = (
-            "You are TATVA, an AI Knowledge Assistant specialising in Ayurveda, "
-            "Traditional Knowledge, and Intellectual Property Rights (IPR). "
-            "Answer STRICTLY using the provided Knowledge Base Context. "
-            "Do NOT use outside knowledge or extrapolate beyond what is stated. "
-            "If the context is insufficient, say so clearly."
+            "You are TATVA, an evidence-led AI Knowledge Assistant specialising in Ayurveda, "
+            "Traditional Knowledge, Nagoya Protocol / Access and Benefit Sharing (ABS), "
+            "Patents, Trademarks, Geographical Indications, and Indian IPR Regulations. "
+            "Provide helpful, accurate, well-structured and professional guidance. "
+            "When the provided Knowledge Base Context contains relevant information, reference it directly. "
+            "If the context is general or does not mention the specific topic, provide an accurate, authoritative answer "
+            "based on established Ayurveda, biodiversity, and intellectual property frameworks."
         )
         user_prompt = (
-            f"Knowledge Base Context:\n{context}\n\n"
+            f"Topic: {topic}\n\n"
+            f"Knowledge Base Context:\n{context if context.strip() else 'No direct context excerpt available.'}\n\n"
             f"User Question: {question}"
         )
         if language and language.lower() not in ("english", "en"):
             user_prompt += f"\n\nPlease provide your answer in {language}."
 
-        response = client.models.generate_content(
-            model=GEMINI_MODEL,
-            contents=user_prompt,
-            config={
-                "system_instruction": system_instruction,
-                "temperature": 0.1,
-            },
-        )
+        full_prompt = f"{system_instruction}\n\n{user_prompt}"
+        response = generate_response(full_prompt)
         answer = response.text if hasattr(response, "text") else str(response)
 
         if language and language.lower() not in ("english", "en"):
@@ -527,7 +583,11 @@ def ask():
 
     except Exception as e:
         print("ERROR IN /ask:", e)
-        return jsonify({"answer": f"An error occurred: {str(e)}"}), 500
+        return jsonify({
+            "answer": f"I encountered an issue processing your query: {str(e)}. Please try asking again in a moment.",
+            "sources": [],
+            "error": "server_error"
+        }), 200
 
 
 # ---------------------------------------------------------------------------

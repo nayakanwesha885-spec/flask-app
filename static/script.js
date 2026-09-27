@@ -442,7 +442,14 @@ async function askQuestion() {
             })
         });
 
-        const data = await response.json();
+        const contentType = response.headers.get("content-type") || "";
+        let data;
+        if (contentType.includes("application/json")) {
+            data = await response.json();
+        } else {
+            await response.text();
+            throw new Error(getTranslation("requestError") || "Server returned an unexpected response. Please try again.");
+        }
 
         if (!response.ok) {
             const error = new Error(data.answer || "The server could not answer the question.");
