@@ -254,8 +254,13 @@ SYSTEM_INSTRUCTION = (
     "4. Always include an educational disclaimer stating that this guidance is for educational purposes and does not constitute formal legal or medical advice."
 )
 
-def generate_ai_response(question: str, context: str) -> str:
+def generate_ai_response(question: str, context: str, language: str = "English") -> str:
     prompt = f"Knowledge Base Context:\n{context}\n\nUser Question:\n{question}\n\nPlease provide a comprehensive, source-grounded response."
+    system_instruction = (
+        f"{SYSTEM_INSTRUCTION}\n\n"
+        f"Respond entirely in {language}. Do not answer in English unless English was selected. "
+        "Keep official names and acronyms where appropriate, and explain them in the selected language."
+    )
 
     # Try Gemini models in priority order
     if gemini_client:
@@ -265,7 +270,7 @@ def generate_ai_response(question: str, context: str) -> str:
                     model=model_id,
                     contents=prompt,
                     config={
-                        "system_instruction": SYSTEM_INSTRUCTION,
+                        "system_instruction": system_instruction,
                         "temperature": 0.2,
                     },
                 )
@@ -281,7 +286,7 @@ def generate_ai_response(question: str, context: str) -> str:
             response = openai_client.chat.completions.create(
                 model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
                 messages=[
-                    {"role": "system", "content": SYSTEM_INSTRUCTION},
+                    {"role": "system", "content": system_instruction},
                     {"role": "user", "content": prompt}
                 ],
                 temperature=0.2,
@@ -291,11 +296,12 @@ def generate_ai_response(question: str, context: str) -> str:
             print(f"[WARN] OpenAI completion error: {e}")
 
     # Offline knowledge synthesis fallback
-    return (
+    fallback = (
         f"Based on the TATVA Knowledge Base:\n\n"
         f"{context[:1500]}\n\n"
         f"*Note: Guidance generated from verified statutory records. Consult relevant authorities for official verification.*"
     )
+    return fallback
 
 # ---------------------------------------------------------------------------
 # Multi-Language Translation
@@ -309,6 +315,17 @@ LANG_CODE_MAP = {
     "telugu": "te", "urdu": "ur",
 }
 
+SUPPORTED_LANGUAGES = {
+    "english": "English",
+    "en": "English",
+    **{language: language.title() for language in LANG_CODE_MAP},
+}
+
+def normalize_language(language) -> str:
+    if not isinstance(language, str):
+        return "English"
+    return SUPPORTED_LANGUAGES.get(language.strip().lower(), "English")
+
 def translate_if_needed(text: str, language: str) -> str:
     if not text or not language:
         return text
@@ -321,11 +338,89 @@ def translate_if_needed(text: str, language: str) -> str:
         return text
 
     try:
-        translated = GoogleTranslator(source="auto", target=target_code).translate(text[:2500])
-        return translated if translated else text
+        return _translate_with_google(text, target_code)
     except Exception as e:
         print(f"[WARN] Translation to {language} failed ({e}), returning English.")
         return text
+
+
+class AnswerTranslationError(Exception):
+    """Raised when an answer cannot be translated into the requested language."""
+
+
+def _translation_chunks(text: str, max_chars: int = 2000):
+    for line in re.findall(r".*?(?:\n|$)", text):
+        if not line:
+            continue
+        while len(line) > max_chars:
+            split_at = line.rfind(" ", 0, max_chars + 1)
+            if split_at <= 0:
+                split_at = max_chars
+            yield line[:split_at]
+            line = line[split_at:]
+        if line:
+            yield line
+
+
+def _translate_with_google(text: str, target_code: str) -> str:
+    translated_chunks = [
+        GoogleTranslator(source="auto", target=target_code).translate(chunk)
+        for chunk in _translation_chunks(text)
+    ]
+    if not translated_chunks or any(not chunk for chunk in translated_chunks):
+        raise ValueError("The translation service returned an empty result.")
+    return "".join(translated_chunks)
+
+
+def _translate_with_ai(text: str, language: str) -> str:
+    prompt = (
+        f"Translate the following complete answer into {language}. "
+        "Preserve its meaning, citations, names, formatting, and disclaimers. "
+        f"Return only the translation, entirely in {language}:\n\n{text}"
+    )
+
+    if gemini_client:
+        for model_id in MODEL_PIPELINE:
+            try:
+                response = gemini_client.models.generate_content(
+                    model=model_id,
+                    contents=prompt,
+                    config={"temperature": 0.1},
+                )
+                if response and getattr(response, "text", None):
+                    return response.text.strip()
+            except Exception as e:
+                print(f"[WARN] Gemini translation with {model_id} failed ({e}), trying next model...")
+
+    if openai_client:
+        try:
+            response = openai_client.chat.completions.create(
+                model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.1,
+            )
+            translated = response.choices[0].message.content
+            if translated:
+                return translated.strip()
+        except Exception as e:
+            print(f"[WARN] OpenAI translation failed ({e}).")
+
+    raise AnswerTranslationError(f"No translation provider could translate the answer into {language}.")
+
+
+def translate_answer(text: str, language: str) -> str:
+    if not text or language.strip().lower() in ("english", "en"):
+        return text
+
+    target_code = LANG_CODE_MAP.get(language.strip().lower())
+    if target_code in {"brx", "ks", "mni", "sat"}:
+        return _translate_with_ai(text, language)
+
+    try:
+        return _translate_with_google(text, target_code)
+    except Exception as e:
+        print(f"[WARN] Google translation to {language} failed ({e}); trying AI translation.")
+        return _translate_with_ai(text, language)
 
 # ---------------------------------------------------------------------------
 # Routes
@@ -363,12 +458,14 @@ def ask():
 
     raw_question = data.get("question", "")
     question = raw_question.strip() if isinstance(raw_question, str) else ""
-    language = data.get("language", "English")
+    language = normalize_language(data.get("language", "English"))
     topic = data.get("topic", "General")
 
     if not question:
         return jsonify({
-            "answer": "Please enter a question to consult the TATVA Knowledge Desk.",
+            "answer": translate_if_needed(
+                "Please enter a question to consult the TATVA Knowledge Desk.", language
+            ),
             "sources": [],
             "citation_status": "no_citation"
         }), 200
@@ -376,7 +473,12 @@ def ask():
     # Guardrail: Check relevance to Ayurveda, Traditional Knowledge, or IPR
     if not is_question_relevant(question, topic=topic):
         return jsonify({
-            "answer": "The local knowledge base does not contain relevant information to answer this question. TATVA specializes in Ayurveda, Traditional Knowledge, and Intellectual Property Rights (Patents, Trademarks, GI, Copyright, and Regulations).",
+            "answer": translate_if_needed(
+                "The local knowledge base does not contain relevant information to answer this question. "
+                "TATVA specializes in Ayurveda, Traditional Knowledge, and Intellectual Property Rights "
+                "(Patents, Trademarks, GI, Copyright, and Regulations).",
+                language,
+            ),
             "sources": [],
             "citation_status": "no_citation"
         }), 200
@@ -385,21 +487,24 @@ def ask():
     q_lower = question.lower()
     if any(h in q_lower for h in ("poison to harm", "harm someone", "kill someone", "toxic poison")):
         return jsonify({
-            "answer": "TATVA is dedicated to the safe, ethical, and legal study of Ayurveda and Intellectual Property. Classical Ayurvedic texts emphasize therapeutic healing and strict purification procedures (Shodhana) to ensure consumer safety.",
+            "answer": translate_if_needed(
+                "TATVA is dedicated to the safe, ethical, and legal study of Ayurveda and Intellectual Property. "
+                "Classical Ayurvedic texts emphasize therapeutic healing and strict purification procedures "
+                "(Shodhana) to ensure consumer safety.",
+                language,
+            ),
             "sources": ["The Ayurvedic Pharmacopoeia of India (API)"],
             "citation_status": "cited"
         }), 200
 
+    sources = []
     try:
         # 1. Search Knowledge Base
         context, sources = search_knowledge_base(question, topic=topic)
 
         # 2. Generate AI Response
-        answer = generate_ai_response(question, context)
-
-        # 3. Translate if required
-        if language and language.strip().lower() not in ("english", "en"):
-            answer = translate_if_needed(answer, language)
+        answer = generate_ai_response(question, context, language)
+        answer = translate_answer(answer, language)
 
         return jsonify({
             "answer": answer,
@@ -407,10 +512,22 @@ def ask():
             "citation_status": "cited" if sources else "no_citation"
         }), 200
 
+    except AnswerTranslationError as e:
+        print(f"[ERROR] Could not translate /ask response: {e}")
+        return jsonify({
+            "answer": "TATVA could not translate this answer right now. Please try again shortly.",
+            "sources": sources,
+            "citation_status": "cited" if sources else "no_citation",
+            "error": "translation_unavailable",
+        }), 503
+
     except Exception as e:
         print(f"[ERROR] Exception in /ask: {e}")
         return jsonify({
-            "answer": "TATVA encountered a temporary processing issue. Please try rephrasing your question.",
+            "answer": translate_if_needed(
+                "TATVA encountered a temporary processing issue. Please try rephrasing your question.",
+                language,
+            ),
             "sources": ["TATVA Knowledge Desk"],
             "citation_status": "no_citation",
             "error": str(e)

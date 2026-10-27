@@ -59,21 +59,145 @@ def test_pdf_references_are_not_rejected():
     assert app_module.is_question_relevant("What is the capital of France?", "General") is False
 
 
-def test_rag_translation_falls_back_when_translation_fails():
-    client = flask_app.test_client()
-    response = client.post(
+def test_answer_translation_failure_is_reported(monkeypatch):
+    monkeypatch.setattr(app_module, "generate_ai_response", lambda question, context, language: "English answer")
+    monkeypatch.setattr(app_module, "search_knowledge_base", lambda question, topic: ("Context", ["Source"]))
+
+    def fail_translation(text, language):
+        raise app_module.AnswerTranslationError("Translation service unavailable")
+
+    monkeypatch.setattr(app_module, "translate_answer", fail_translation)
+    response = flask_app.test_client().post(
+        "/ask",
+        json={"question": "What is Ayurveda traditional knowledge?", "language": "Odia"},
+    )
+
+    assert response.status_code == 503
+    assert response.get_json()["error"] == "translation_unavailable"
+
+
+def test_ask_instructs_ai_to_respond_in_selected_language(monkeypatch):
+    captured = {}
+
+    class FakeModels:
+        def generate_content(self, **kwargs):
+            captured.update(kwargs)
+
+            class Response:
+                text = "Answer in English"
+
+            return Response()
+
+    class FakeGeminiClient:
+        models = FakeModels()
+
+    class FakeTranslator:
+        def __init__(self, source, target):
+            captured["translation_target"] = target
+
+        def translate(self, text):
+            return f"Hindi: {text}"
+
+    monkeypatch.setattr(app_module, "gemini_client", FakeGeminiClient())
+    monkeypatch.setattr(app_module, "MODEL_PIPELINE", ["test-model"])
+    monkeypatch.setattr(app_module, "GoogleTranslator", FakeTranslator)
+    monkeypatch.setattr(
+        app_module,
+        "search_knowledge_base",
+        lambda question, topic: ("Relevant context", ["Test source"]),
+    )
+
+    response = flask_app.test_client().post(
         "/ask",
         json={
             "question": "What is Ayurveda traditional knowledge?",
-            "language": "Odia",
+            "language": "Hindi",
             "topic": "Traditional Knowledge",
         },
     )
 
     assert response.status_code == 200
-    payload = response.get_json()
-    assert "answer" in payload
-    assert payload["answer"]
+    assert response.get_json()["answer"] == "Hindi: Answer in English"
+    assert "Respond entirely in Hindi" in captured["config"]["system_instruction"]
+    assert captured["translation_target"] == "hi"
+
+
+def test_answer_translation_processes_entire_long_response(monkeypatch):
+    chunks = []
+
+    class FakeTranslator:
+        def __init__(self, source, target):
+            pass
+
+        def translate(self, text):
+            chunks.append(text)
+            return text
+
+    monkeypatch.setattr(app_module, "GoogleTranslator", FakeTranslator)
+    answer = "A" * 2500 + "\n" + "B" * 2500
+
+    translated = app_module.translate_answer(answer, "Hindi")
+
+    assert translated == answer
+    assert len(chunks) > 2
+    assert all(len(chunk) <= 2000 for chunk in chunks)
+
+
+def test_google_rate_limit_falls_back_to_ai_translation(monkeypatch):
+    class RateLimitedTranslator:
+        def __init__(self, source, target):
+            raise RuntimeError("TooManyRequests")
+
+    monkeypatch.setattr(app_module, "GoogleTranslator", RateLimitedTranslator)
+    monkeypatch.setattr(
+        app_module,
+        "_translate_with_ai",
+        lambda text, language: f"{language} translation",
+    )
+
+    assert app_module.translate_answer("English answer", "Hindi") == "Hindi translation"
+
+
+def test_ask_returns_localized_answer_when_google_translation_is_rate_limited(monkeypatch):
+    class FakeModels:
+        def generate_content(self, **kwargs):
+            class Response:
+                text = "Answer in English"
+
+            return Response()
+
+    class FakeGeminiClient:
+        models = FakeModels()
+
+    class RateLimitedTranslator:
+        def __init__(self, source, target):
+            raise RuntimeError("TooManyRequests")
+
+    monkeypatch.setattr(app_module, "gemini_client", FakeGeminiClient())
+    monkeypatch.setattr(app_module, "MODEL_PIPELINE", ["test-model"])
+    monkeypatch.setattr(app_module, "GoogleTranslator", RateLimitedTranslator)
+    monkeypatch.setattr(
+        app_module,
+        "search_knowledge_base",
+        lambda question, topic: ("Relevant context", ["Test source"]),
+    )
+    monkeypatch.setattr(
+        app_module,
+        "_translate_with_ai",
+        lambda text, language: "हिंदी में उत्तर",
+    )
+
+    response = flask_app.test_client().post(
+        "/ask",
+        json={
+            "question": "What is Ayurveda traditional knowledge?",
+            "language": "Hindi",
+            "topic": "Traditional Knowledge",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.get_json()["answer"] == "हिंदी में उत्तर"
 
 
 def test_guardrails_removed_for_harmful_or_toxic_requests():
